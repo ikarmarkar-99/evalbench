@@ -2,6 +2,7 @@
 
 import json
 import csv
+import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +15,140 @@ from .query_converters.base import (
 )
 from .query_executor import QueryExecutor
 from .utils.llm import gemini_inference
+
+
+def _split_top_level_commas(expr_list: str) -> List[str]:
+    """Split a SQL expression list by top-level commas outside parentheses and quotes.
+
+    Args:
+        expr_list: Raw SQL expression list (such as a SELECT or ORDER BY body).
+
+    Returns:
+        List of trimmed individual SQL expressions.
+    """
+    parts = []
+    current = []
+    depth = 0
+    in_single_quote = False
+    in_double_quote = False
+    for ch in expr_list:
+        if ch == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+        elif ch == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+        elif not in_single_quote and not in_double_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch == "," and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+                continue
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+
+def _strip_select_alias(expr: str) -> str:
+    """Strip a trailing `AS alias` clause from a SELECT expression.
+
+    Args:
+        expr: Single SELECT list expression.
+
+    Returns:
+        Expression string without its trailing column alias.
+    """
+    # Matches `<expression> AS <identifier>` where identifier may be unquoted,
+    # double-quoted, or backtick-quoted.
+    match = re.match(
+        r"^(.*?)\s+AS\s+(?:`[^`]+`|\"[^\"]+\"|[A-Za-z0-9_]+)\s*$",
+        expr,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        return match.group(1).strip()
+    return expr.strip()
+
+
+def _inject_window_tiebreakers(sql: str) -> str:
+    """Append sibling SELECT columns as tie-breakers to `ROWS BETWEEN` window clauses.
+
+    When an outer `WHERE`, `GROUP BY`, or `SELECT DISTINCT` filters or groups by
+    a sliding-window aggregate (`MIN`/`MAX`/`AVG`/`SUM` with `ROWS BETWEEN ...`)
+    that orders by a non-unique column, different tie orders inside the window
+    frame can change the outer row count. Appending the sibling `SELECT`
+    expressions and the aggregated column to `OVER (... ORDER BY ... ROWS BETWEEN ...)`
+    in both source and destination queries imposes the same deterministic tie order.
+
+    Args:
+        sql: Original or converted SQL query string.
+
+    Returns:
+        SQL query string with sibling tie-breakers appended to `ROWS BETWEEN` windows.
+    """
+    def replace_select_block(match: re.Match) -> str:
+        """Rewrite a single SELECT ... FROM block if it contains ROWS BETWEEN."""
+        prefix = match.group(1)
+        select_body = match.group(2)
+        suffix = match.group(3)
+        if (
+            "OVER" not in select_body.upper()
+            or "ROWS BETWEEN" not in select_body.upper()
+        ):
+            return match.group(0)
+
+        items = _split_top_level_commas(select_body)
+        non_window_exprs = []
+        window_agg_args = []
+        for item in items:
+            if "OVER" in item.upper():
+                # Extract the column inside MIN(col) / MAX(col) / AVG(col) / SUM(col) OVER (...)
+                agg_match = re.search(
+                    r"\b(?:MIN|MAX|AVG|SUM)\s*\(\s*([^()]+?)\s*\)\s*OVER",
+                    item,
+                    re.IGNORECASE,
+                )
+                if agg_match:
+                    window_agg_args.append(agg_match.group(1).strip())
+            else:
+                base_expr = _strip_select_alias(item)
+                if base_expr and "*" not in base_expr:
+                    non_window_exprs.append(base_expr)
+
+        tie_cols = non_window_exprs + window_agg_args
+        if not tie_cols:
+            return match.group(0)
+
+        tie_suffix = ", " + ", ".join(tie_cols)
+
+        def replace_over_order(over_match: re.Match) -> str:
+            """Keep the primary window ORDER BY key and append the shared tie-breakers."""
+            order_body = over_match.group(1).strip()
+            first_key = _split_top_level_commas(order_body)[0]
+            first_key = re.sub(
+                r"\s+(?:ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b",
+                "",
+                first_key,
+                flags=re.IGNORECASE,
+            ).strip()
+            return f"ORDER BY {first_key}{tie_suffix} ROWS BETWEEN"
+
+        new_body = re.sub(
+            r"ORDER\s+BY\s+(.*?)\s+ROWS\s+BETWEEN",
+            replace_over_order,
+            select_body,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return f"{prefix}{new_body}{suffix}"
+
+    return re.sub(
+        r"(\bSELECT\s+(?:DISTINCT\s+)?)(.*?)(\s+FROM\b)",
+        replace_select_block,
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
 
 class QueryConversionOrchestrator:
@@ -165,6 +300,18 @@ class QueryConversionOrchestrator:
                         matches, match_reason = self.converter.compare_results(
                             source_result, dest_result
                         )
+                        if (
+                            not matches
+                            and getattr(self.converter, 'allow_tie_equivalence', True)
+                            and source_result.total_rows != dest_result.total_rows
+                            and len(source_result.columns) == len(dest_result.columns)
+                            and 'ROWS BETWEEN' in source_query.upper()
+                        ):
+                            tb_matches, tb_reason = self._check_shared_window_tiebreaker(
+                                source_query, converted_query
+                            )
+                            if tb_matches:
+                                matches, match_reason = True, tb_reason
                         if matches:
                             safe_print(f"✓ Results MATCH! {match_reason}")
                             return ConversionResult(
@@ -329,6 +476,15 @@ class QueryConversionOrchestrator:
                 self.source_connection['database'],
                 query
             )
+        elif self.converter.source_dialect == 'mysql':
+            return self.executor.execute_mysql(
+                self.source_connection['host'],
+                self.source_connection['port'],
+                self.source_connection['user'],
+                self.source_connection['password'],
+                self.source_connection['database'],
+                query
+            )
         elif self.converter.source_dialect == 'bigquery':
             return self.executor.execute_bigquery(
                 self.source_connection['project_id'],
@@ -337,6 +493,43 @@ class QueryConversionOrchestrator:
             )
         else:
             raise NotImplementedError(f"Source dialect {self.converter.source_dialect} not supported yet")
+
+    def _check_shared_window_tiebreaker(
+        self,
+        source_query: str,
+        converted_query: str,
+    ) -> Tuple[bool, str]:
+        """Re-run both queries with shared tie-breakers on `ROWS BETWEEN` windows.
+
+        When an outer `WHERE`, `GROUP BY`, or `SELECT DISTINCT` depends on a
+        moving-window column (`MIN`/`MAX`/`AVG`/`SUM` with `ROWS BETWEEN ...`)
+        ordered by a non-unique key, different tie orders inside the window
+        frame can change the outer row count. This method appends the sibling
+        `SELECT` columns and window aggregate argument as a shared tie-breaker
+        in both queries, executes both, and checks `compare_results`.
+
+        Args:
+            source_query: Original SQL query in the source dialect.
+            converted_query: Candidate SQL query in the destination dialect.
+
+        Returns:
+            Tuple of `(matches, reason)` after applying shared window tie-breakers.
+        """
+        src_tb = _inject_window_tiebreakers(source_query)
+        dest_tb = _inject_window_tiebreakers(converted_query)
+        if src_tb == source_query and dest_tb == converted_query:
+            return False, "No ROWS BETWEEN window tie-breakers injected"
+        r_src = self._execute_source_query(src_tb)
+        r_dest = self._execute_dest_query(dest_tb)
+        if r_src.error or r_dest.error:
+            return False, "Tie-broken query execution failed"
+        ok, reason = self.converter.compare_results(r_src, r_dest)
+        if ok:
+            return (
+                True,
+                f"All checks passed (shared window tie-breaker: {r_src.total_rows} rows): {reason}",
+            )
+        return False, reason
     
     def _execute_dest_query(self, query: str) -> QueryResult:
         """Execute query on destination database."""
