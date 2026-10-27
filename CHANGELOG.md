@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.1](https://github.com/GoogleCloudPlatform/evalbench/compare/v1.21.0...v1.21.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* **gke:** add health probes and make the deploy single-pod safe ([0ce5185](https://github.com/GoogleCloudPlatform/evalbench/commit/0ce5185ca8f59090863547d55577511e4841a828))
+
 ## [1.21.0](https://github.com/GoogleCloudPlatform/evalbench/compare/v1.20.0...v1.21.0) (2026-10-27)
 
 
