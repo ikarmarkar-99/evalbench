@@ -296,13 +296,25 @@ class QueryConversionOrchestrator:
                     else:
                         safe_print(f"✓ Executed: {dest_result.total_rows} rows")
                         
-                        # Check if results match
-                        matches, match_reason = self.converter.compare_results(
-                            source_result, dest_result
+                        # Check if results match (default allow_tie_equivalence to False
+                        # so existing converters keep strict comparison and never run tie retries).
+                        allow_tie_eq = getattr(
+                            self.converter, 'allow_tie_equivalence', False
                         )
+                        if allow_tie_eq:
+                            matches, match_reason = self.converter.compare_results(
+                                source_result,
+                                dest_result,
+                                source_query=source_query,
+                                converted_query=converted_query,
+                            )
+                        else:
+                            matches, match_reason = self.converter.compare_results(
+                                source_result, dest_result
+                            )
                         if (
                             not matches
-                            and getattr(self.converter, 'allow_tie_equivalence', True)
+                            and allow_tie_eq
                             and source_result.total_rows != dest_result.total_rows
                             and len(source_result.columns) == len(dest_result.columns)
                             and 'ROWS BETWEEN' in source_query.upper()
@@ -523,7 +535,15 @@ class QueryConversionOrchestrator:
         r_dest = self._execute_dest_query(dest_tb)
         if r_src.error or r_dest.error:
             return False, "Tie-broken query execution failed"
-        ok, reason = self.converter.compare_results(r_src, r_dest)
+        if getattr(self.converter, 'allow_tie_equivalence', False):
+            ok, reason = self.converter.compare_results(
+                r_src,
+                r_dest,
+                source_query=src_tb,
+                converted_query=dest_tb,
+            )
+        else:
+            ok, reason = self.converter.compare_results(r_src, r_dest)
         if ok:
             return (
                 True,
