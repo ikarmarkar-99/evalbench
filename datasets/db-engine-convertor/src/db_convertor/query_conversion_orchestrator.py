@@ -349,10 +349,14 @@ def _is_expr_text_col(
             if cname == col:
                 return is_t
         return False
-    # Otherwise, check if that column name is always text across the schema.
+    # Otherwise, check if that column name (or a derived alias like `top_organization_name`
+    # or `hist_...`) is always text across the schema.
     if col in pure_text_cols:
         return True
-    return col.startswith("hist_") and col[5:] in pure_text_cols
+    for p in ("hist_", "top_", "min_", "max_", "most_represented_", "most_active_"):
+        if col.startswith(p) and col[len(p) :] in pure_text_cols:
+            return True
+    return False
 
 
 def _format_tie_expr(
@@ -528,9 +532,18 @@ def _extract_cte_columns(
             r"^\s*SELECT\s+(?:DISTINCT\s+)?", masked, flags=re.IGNORECASE
         )
         from_m = re.search(r"\bFROM\b", masked, flags=re.IGNORECASE)
+        if not sel_m:
+            sel_m = re.search(
+                r"\bSELECT\s+(?:DISTINCT\s+)?", masked, flags=re.IGNORECASE
+            )
         if not sel_m or not from_m:
             continue
-        s_body = inner[sel_m.end() : from_m.start()]
+        from_m = re.search(
+            r"\bFROM\b", masked[sel_m.end() :], flags=re.IGNORECASE
+        )
+        if not from_m:
+            continue
+        s_body = inner[sel_m.end() : sel_m.end() + from_m.start()]
         cols: List[Tuple[str, bool]] = []
         # Extract each column's output name (either its `AS alias` or its bare column name).
         for item in _split_top_level_commas(s_body):
@@ -624,6 +637,9 @@ def _inject_tiebreakers_in_select(
     table_key_exprs: List[Tuple[str, bool]] = []
     q = "`" if dialect == "mysql" else ('"' if dialect == "postgresql" else "")
     has_bare_star = bool(re.match(r"^\s*\*\s*$", select_body))
+    has_any_star = bool(
+        re.match(r"^\s*(?:[`\"]?\w+[`\"]?\.)?\*\s*(?:,|$)", select_body)
+    )
 
     # Find each table name and its optional nickname (alias) in `FROM table alias JOIN table2 alias2`.
     t_pat = re.compile(
@@ -661,11 +677,10 @@ def _inject_tiebreakers_in_select(
                     table_key_exprs.append((f"{q}{raw_a}{q}.{q}{cname}{q}", is_t))
         elif (
             raw_t in cte_tables
-            and (has_bare_star or "fdc.*" in select_body.lower())
             and not has_group_by
             and not is_distinct
         ):
-            # If the query selects `*` from a helper `WITH` table (CTE), use the CTE's columns.
+            # If the query reads from a helper `WITH` table (CTE), use the CTE's columns.
             for cname, is_t in cte_tables[raw_t]:
                 if has_bare_star:
                     table_key_exprs.append((f"{q}{cname}{q}", is_t))
@@ -771,11 +786,19 @@ def _inject_tiebreakers_in_select(
                     if ob_keys
                     else ""
                 )
-                # Keep the query's primary sort key (or 3-part date sort keys ending in `_sort`),
+                # Keep the query's primary sort key (or 3-part date sort keys ending in `_sort`,
+                # or 2-part sort keys ending in `_sort` when the 2nd key starts with `min_`/`max_`),
                 # then append the shared tie-breaker columns so both MySQL and PostgreSQL
                 # break ties on the primary key in the exact same order.
-                if first_k_clean.endswith("_sort") and len(ob_keys) >= 3:
+                second_k_clean = (
+                    _extract_key_dir(ob_keys[1])[0].strip('`"').lower()
+                    if len(ob_keys) >= 2
+                    else ""
+                )
+                if first_k_clean.endswith("_sort") and len(ob_keys) >= 3 and second_k_clean.endswith("_sort"):
                     kept_keys = ob_keys[:3]
+                elif first_k_clean.endswith("_sort") and len(ob_keys) >= 2 and second_k_clean.startswith(("min_", "max_")):
+                    kept_keys = ob_keys[:2]
                 elif not candidate_ties:
                     kept_keys = ob_keys
                 else:
@@ -829,17 +852,61 @@ def _inject_tiebreakers_in_select(
             else 1
         )
         kept_keys = ob_keys[:kept_count]
+        # Build alias-to-expression map so `ORDER BY alias` on a `GROUP BY` query
+        # uses the underlying aggregate expression (`MAX(...)`, `SUM(...)`, `COUNT(...)`)
+        # when adding `IS NULL ASC` in MySQL `ONLY_FULL_GROUP_BY` mode.
+        select_alias_map: Dict[str, str] = {}
+        for item in items:
+            item_s = item.strip()
+            item_masked = _mask_parens_and_strings(item_s)
+            as_m = re.search(
+                r"\bAS\s+([`\"]?\w+[`\"]?)\s*$",
+                item_masked,
+                flags=re.IGNORECASE,
+            )
+            if as_m:
+                al = item_s[as_m.start(1) : as_m.end(1)].strip('`"').lower()
+                select_alias_map[al] = item_s[: as_m.start()].strip()
         primary_formatted = []
         for k in kept_keys:
             bk, dk = _extract_key_dir(k)
+            bk_lookup = bk.strip('`"').lower()
+            if has_group_by and bk_lookup in select_alias_map:
+                bk = select_alias_map[bk_lookup]
             is_tk = _is_expr_text_col(
                 bk, alias_to_table, schema_tables, pure_text_cols
             )
             primary_formatted.append(_format_tie_expr(bk, dialect, is_tk, dk))
-        tail_ties = [
-            _format_tie_expr(e, dialect, is_t, "ASC")
-            for e, is_t in non_window_exprs
-        ]
+        tail_ties = []
+        if not has_group_by:
+            tail_ties = [
+                _format_tie_expr(e, dialect, is_t, "ASC")
+                for e, is_t in non_window_exprs
+            ]
+        elif re.search(r"\bROLLUP\b", after_from_masked, flags=re.IGNORECASE):
+            for idx in range(1, len(items) + 1):
+                if dialect == "mysql":
+                    tail_ties.append(f"{idx} ASC")
+                else:
+                    tail_ties.append(f"{idx} ASC NULLS FIRST")
+        elif has_user_var:
+            gb_m_tail = re.search(
+                r"\bGROUP\s+BY\s+(.*?)(?=\s+\b(?:WITH\s+ROLLUP|HAVING|ORDER\s+BY|LIMIT|WINDOW)\b|\s*$)",
+                after_from_masked,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if gb_m_tail:
+                gb_raw_t = after_from_raw[gb_m_tail.start(1) : gb_m_tail.end(1)].strip()
+                for g_col in _split_top_level_commas(gb_raw_t):
+                    g_col = g_col.strip()
+                    if g_col:
+                        is_tg = _is_expr_text_col(
+                            g_col, alias_to_table, schema_tables, pure_text_cols
+                        )
+                        tail_ties.append(_format_tie_expr(g_col, dialect, is_tg, "ASC"))
+        else:
+            for e, is_t in non_window_exprs:
+                tail_ties.append(_format_tie_expr(e, dialect, is_t, "ASC"))
         if not has_group_by and not is_distinct:
             tail_ties.extend(
                 _format_tie_expr(e, dialect, is_t, "ASC")
