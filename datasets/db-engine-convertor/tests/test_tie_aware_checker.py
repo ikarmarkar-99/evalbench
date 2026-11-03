@@ -16,8 +16,10 @@ This module contains:
     queries while leaving `DENSE_RANK` untouched.
 """
 
+import decimal
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import unittest
 from unittest import mock
@@ -27,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from db_convertor.query_conversion_orchestrator import (  # pylint: disable=g-import-not-at-top
     QueryConversionOrchestrator,
     _inject_deterministic_tiebreakers,
-    _inject_window_tiebreakers,
+    _window_allows_tiebreakers,
 )
 from db_convertor.query_converters.base import (  # pylint: disable=g-import-not-at-top
     ConversionStatus,
@@ -58,8 +60,8 @@ class TestTieAwareResultComparison(unittest.TestCase):
         self.assertIn("SOURCE (MySQL):", prompt)
         self.assertIn("DESTINATION (PostgreSQL):", prompt)
 
-    def test_strict_positional_allows_four_decimal_truncation(self):
-        """Verify 4-decimal MySQL AVG/DIV truncation matches full float precision."""
+    def test_four_decimal_mysql_rounding_matches_only_exact_rounding(self):
+        """MySQL's 4-decimal AVG/DIV value matches the full value only if it is that value rounded."""
         converter = MySQLToPGQueryConverter()
         src = QueryResult(
             columns=["dept", "avg_units"],
@@ -74,6 +76,13 @@ class TestTieAwareResultComparison(unittest.TestCase):
         matches, reason = converter.compare_results(src, dest)
         self.assertTrue(matches)
         self.assertIn("data matches", reason)
+        # A real difference in the 4th decimal is still a mismatch.
+        dest_off = QueryResult(
+            columns=["dept", "avg_units"],
+            rows=[("Physics", 11.3340), ("Math", 9.666666666666666)],
+            total_rows=2,
+        )
+        self.assertFalse(converter.compare_results(src, dest_off)[0])
 
     def test_same_rows_reordered_on_ties(self):
         """Verify two tables with the exact same rows across all columns in different tie orders match."""
@@ -96,14 +105,20 @@ class TestTieAwareResultComparison(unittest.TestCase):
             ],
             total_rows=3,
         )
-        matches, reason = converter.compare_results(src, dest)
+        query = "SELECT term_code, subject_id, units FROM t ORDER BY term_code"
+        matches, reason = converter.compare_results(src, dest, source_query=query)
         self.assertTrue(matches)
         self.assertIn("same rows reordered", reason)
 
         # When allow_tie_equivalence is False, reordered rows must be rejected.
         strict_converter = MySQLToPGQueryConverter(allow_tie_equivalence=False)
-        strict_matches, _ = strict_converter.compare_results(src, dest)
+        strict_matches, _ = strict_converter.compare_results(
+            src, dest, source_query=query
+        )
         self.assertFalse(strict_matches)
+
+        # Without the source query the order cannot be checked, so reject.
+        self.assertFalse(converter.compare_results(src, dest)[0])
 
     def test_no_column_dropping_rejects_any_single_column_mismatch(self):
         """Verify compare_results never drops columns and rejects any single-column mismatch."""
@@ -212,6 +227,232 @@ class TestTieAwareResultComparison(unittest.TestCase):
         self.assertFalse(matches)
 
 
+def _result(columns, rows):
+    """Builds a QueryResult from column names and rows."""
+    return QueryResult(columns=columns, rows=list(rows), total_rows=len(rows))
+
+
+class TestRowOrderIsChecked(unittest.TestCase):
+    """Tests that Check 2 only lets rows move within ORDER BY ties."""
+
+    def setUp(self):
+        """Creates the converter under test."""
+        self.converter = MySQLToPGQueryConverter()
+
+    def _matches(self, query, src_rows, dest_rows, columns=("name", "n")):
+        """Returns whether `compare_results` accepts the two results."""
+        return self.converter.compare_results(
+            _result(list(columns), src_rows),
+            _result(list(columns), dest_rows),
+            source_query=query,
+        )[0]
+
+    def test_reversed_sort_is_rejected(self):
+        """DESC in MySQL vs ASC in PostgreSQL, with no ties, does not match."""
+        self.assertFalse(
+            self._matches(
+                "SELECT name, n FROM t ORDER BY n DESC",
+                [("a", 3), ("b", 2), ("c", 1)],
+                [("c", 1), ("b", 2), ("a", 3)],
+            )
+        )
+
+    def test_tied_rows_may_swap(self):
+        """Rows tied on the sort key may come back in either order."""
+        self.assertTrue(
+            self._matches(
+                "SELECT name, n FROM t ORDER BY n DESC",
+                [("a", 3), ("b", 2), ("c", 2), ("d", 1)],
+                [("a", 3), ("c", 2), ("b", 2), ("d", 1)],
+            )
+        )
+
+    def test_rows_swapped_across_a_tie_group_are_rejected(self):
+        """A row may not jump into another group of tied rows."""
+        self.assertFalse(
+            self._matches(
+                "SELECT name, n FROM t ORDER BY n DESC",
+                [("a", 3), ("b", 2), ("c", 2), ("d", 1)],
+                [("b", 2), ("a", 3), ("c", 2), ("d", 1)],
+            )
+        )
+
+    def test_wrong_second_sort_key_is_rejected(self):
+        """Same first key, but the second key sorted the other way."""
+        self.assertFalse(
+            self._matches(
+                "SELECT name, n FROM t ORDER BY n DESC, name ASC",
+                [("a", 2), ("b", 2), ("c", 1)],
+                [("b", 2), ("a", 2), ("c", 1)],
+            )
+        )
+
+    def test_no_order_by_accepts_any_order(self):
+        """Without a top-level ORDER BY, any row order is fine."""
+        self.assertTrue(
+            self._matches(
+                "SELECT name, n FROM (SELECT * FROM t ORDER BY n) x",
+                [("a", 3), ("b", 2)],
+                [("b", 2), ("a", 3)],
+            )
+        )
+
+    def test_order_by_in_window_or_subquery_is_not_the_final_order(self):
+        """ORDER BY inside OVER (...) does not sort the final result."""
+        query = "SELECT name, ROW_NUMBER() OVER (ORDER BY name) AS n FROM t"
+        self.assertTrue(
+            self._matches(query, [("a", 1), ("b", 2)], [("b", 2), ("a", 1)])
+        )
+
+    def test_sort_key_that_is_not_an_output_column_is_rejected(self):
+        """The order cannot be checked if the key is not in the result."""
+        self.assertFalse(
+            self._matches(
+                "SELECT name, n FROM t ORDER BY created_at",
+                [("a", 1), ("b", 2)],
+                [("b", 2), ("a", 1)],
+            )
+        )
+
+    def test_keys_by_position_alias_and_expression(self):
+        """ORDER BY 2, an alias and a SELECT expression all map to columns."""
+        src = [("a", 3), ("b", 2), ("c", 2)]
+        dest_ok = [("a", 3), ("c", 2), ("b", 2)]
+        dest_bad = [("b", 2), ("c", 2), ("a", 3)]
+        for query in (
+            "SELECT name, n FROM t ORDER BY 2 DESC",
+            "SELECT name, cnt AS n FROM t ORDER BY n DESC",
+            "SELECT name, COUNT(*) AS n FROM t GROUP BY name ORDER BY COUNT(*) DESC",
+            "SELECT `t`.`name`, `t`.`n` FROM t ORDER BY `t`.`n` DESC",
+        ):
+            with self.subTest(query=query):
+                self.assertTrue(self._matches(query, src, dest_ok))
+                self.assertFalse(self._matches(query, src, dest_bad))
+
+    def test_null_placement_difference_is_rejected(self):
+        """MySQL puts NULLs first on ASC; PostgreSQL's default puts them last."""
+        self.assertFalse(
+            self._matches(
+                "SELECT name, n FROM t ORDER BY n",
+                [("x", None), ("a", 1), ("b", 2)],
+                [("a", 1), ("b", 2), ("x", None)],
+            )
+        )
+
+    def test_text_order_must_follow_mysql(self):
+        """'apple' before 'Banana' (MySQL) vs 'Banana' first ("C" order)."""
+        self.assertFalse(
+            self._matches(
+                "SELECT name, n FROM t ORDER BY name",
+                [("apple", 1), ("Banana", 2)],
+                [("Banana", 2), ("apple", 1)],
+            )
+        )
+
+    def test_case_only_differences_count_as_ties_for_ordering(self):
+        """MySQL treats 'apple' and 'Apple' as tied, so they may swap."""
+        self.assertTrue(
+            self._matches(
+                "SELECT name, n FROM t ORDER BY name",
+                [("apple", 1), ("Apple", 2), ("berry", 3)],
+                [("Apple", 2), ("apple", 1), ("berry", 3)],
+            )
+        )
+
+    def test_order_by_text_in_quotes_or_comments_is_ignored(self):
+        """'ORDER BY' inside a string or comment is not the query's ORDER BY."""
+        query = (
+            "SELECT name, n FROM t WHERE note = 'order by n' "
+            "-- order by name\n"
+        )
+        self.assertTrue(
+            self._matches(query, [("a", 1), ("b", 2)], [("b", 2), ("a", 1)])
+        )
+
+
+class TestValueRules(unittest.TestCase):
+    """Tests how single cell values are compared."""
+
+    def setUp(self):
+        """Creates the converter under test."""
+        self.converter = MySQLToPGQueryConverter()
+
+    def test_whole_numbers_must_match_exactly(self):
+        """IDs, counts and integer sums may not differ at all."""
+        eq = self.converter._values_equal  # pylint: disable=protected-access
+        self.assertFalse(eq(123456, 123460))
+        self.assertFalse(eq(decimal.Decimal("12345678"), 12346900))
+        self.assertTrue(eq(decimal.Decimal("12345678"), 12345678))
+        self.assertFalse(eq(9007199254740993, 9007199254740992))
+        self.assertTrue(eq(9007199254740993, 9007199254740993))
+
+    def test_decimals_within_1e9_or_exactly_rounded_by_mysql(self):
+        """Non-whole numbers agree within 1e-9, or MySQL's value is the PG value rounded."""
+        eq = self.converter._values_equal  # pylint: disable=protected-access
+        # Exactly MySQL's rounding of the PostgreSQL value.
+        self.assertTrue(eq(decimal.Decimal("11.3333"), 11.333333333333334))
+        self.assertTrue(eq(decimal.Decimal("9.6667"), decimal.Decimal("9.66666666667")))
+        self.assertTrue(eq(decimal.Decimal("-2.3457"), -2.34565))
+        # Off in the last shown digit, so not a rounding of it.
+        self.assertFalse(eq(decimal.Decimal("11.3333"), 11.3340))
+        self.assertFalse(eq(decimal.Decimal("11.3333"), 11.33336))
+        # Only the MySQL side may be the rounded one.
+        self.assertFalse(eq(11.333333333333334, decimal.Decimal("11.3333")))
+        # A whole MySQL number is never matched by rounding.
+        self.assertFalse(eq(decimal.Decimal("12"), 12.4))
+        # MySQL floats have no "shown decimals"; a 0.4% difference fails.
+        self.assertFalse(eq(-0.8394717261835467, -0.8428571428084979))
+        self.assertTrue(eq(decimal.Decimal("5.0000"), 5.0))
+        self.assertTrue(eq(decimal.Decimal("2.5"), 2.5))
+        self.assertTrue(eq(0.1 + 0.2, 0.3))
+        self.assertFalse(eq(2.5, 2.0))
+
+    def test_tolerance_is_relative_to_the_size_of_the_number(self):
+        """Large numbers may differ in their 16th digit; small ones may not move."""
+        eq = self.converter._values_equal  # pylint: disable=protected-access
+        self.assertTrue(eq(decimal.Decimal("16029126931.864092"), 16029126931.864094))
+        self.assertTrue(eq(decimal.Decimal("1520974.2476120926"), 1520974.2476120899))
+        self.assertFalse(eq(decimal.Decimal("1520974.24"), 1520974.26))
+        self.assertFalse(eq(decimal.Decimal("0.000001"), 0.000003))
+
+    def test_mysql_float_values_get_one_part_in_a_million(self):
+        """MySQL FLOAT values (7 digits) may differ by 1e-6; exact decimals may not."""
+        eq = self.converter._values_equal  # pylint: disable=protected-access
+        # Returned as a Python float by MySQL: FLOAT column leeway.
+        self.assertTrue(eq(137.79042429139767, 137.79042406634449))
+        self.assertFalse(eq(137.79, 137.80))
+        # The same numbers as exact decimals get no extra leeway.
+        self.assertFalse(
+            eq(decimal.Decimal("137.79042429139767"), 137.79042406634449)
+        )
+        # Whole numbers stay exact even if MySQL returned a float-like int.
+        self.assertFalse(eq(1000000, 1000001))
+
+    def test_text_must_match_exactly(self):
+        """Letter case, spaces and leading zeros all count."""
+        eq = self.converter._values_equal  # pylint: disable=protected-access
+        self.assertFalse(eq("Alice", "alice"))
+        self.assertFalse(eq("a ", "a"))
+        self.assertFalse(eq("007", "7"))
+        self.assertFalse(eq("007", 7))
+        self.assertTrue(eq("7", 7))
+        self.assertTrue(eq("Alice", "Alice"))
+
+    def test_booleans_match_zero_and_one(self):
+        """MySQL returns 1/0 where PostgreSQL returns true/false."""
+        eq = self.converter._values_equal  # pylint: disable=protected-access
+        self.assertTrue(eq(1, True))
+        self.assertTrue(eq(0, False))
+        self.assertFalse(eq(1, False))
+
+    def test_nulls(self):
+        """Two NULLs match; a NULL and a value do not."""
+        eq = self.converter._values_equal  # pylint: disable=protected-access
+        self.assertTrue(eq(None, None))
+        self.assertFalse(eq(None, 0))
+        self.assertFalse(eq("", None))
+
+
 class TestOrchestratorTieEquivalenceDefault(unittest.TestCase):
     """Tests that `QueryConversionOrchestrator` defaults tie equivalence to `False`."""
 
@@ -270,6 +511,40 @@ class TestOrchestratorTieEquivalenceDefault(unittest.TestCase):
             )
             mock_tb.assert_not_called()
             self.assertEqual(result.status, ConversionStatus.EXHAUSTED_RETRY)
+
+    def test_compare_passes_source_query_only_to_converters_that_take_it(self):
+        """The MySQL converter gets the source query; older converters do not."""
+        src = _result(["n"], [(3,), (1,)])
+        dest = _result(["n"], [(1,), (3,)])
+        mysql_orch = QueryConversionOrchestrator(
+            converter=MySQLToPGQueryConverter(),
+            source_connection={},
+            dest_connection={},
+            source_schema="",
+            dest_schema="",
+        )
+        # Reversed order with ORDER BY n DESC must be rejected...
+        self.assertFalse(
+            mysql_orch._compare(  # pylint: disable=protected-access
+                src, dest, "SELECT n FROM t ORDER BY n DESC"
+            )[0]
+        )
+        # ...but is fine when the query has no ORDER BY.
+        self.assertTrue(
+            mysql_orch._compare(src, dest, "SELECT n FROM t")[0]  # pylint: disable=protected-access
+        )
+        sqlite_orch = QueryConversionOrchestrator(
+            converter=SQLiteToPGQueryConverter(),
+            source_connection={"path": ":memory:"},
+            dest_connection={},
+            source_schema="",
+            dest_schema="",
+        )
+        with mock.patch.object(
+            sqlite_orch.converter, "compare_results", return_value=(False, "x")
+        ) as mock_cmp:
+            sqlite_orch._compare(src, dest, "SELECT n FROM t")  # pylint: disable=protected-access
+            mock_cmp.assert_called_once_with(src, dest)
 
     def test_orchestrator_resolves_tie_via_deterministic_tiebreaker_on_both_queries(self):
         """Verify MySQLToPGQueryConverter runs shared deterministic tie-breakers and requires 100%-column match."""
@@ -336,7 +611,7 @@ class TestOrchestratorTieEquivalenceDefault(unittest.TestCase):
 
 
 class TestDeterministicTiebreakerInjection(unittest.TestCase):
-    """Tests for `_inject_deterministic_tiebreakers` and `_inject_window_tiebreakers`."""
+    """Tests for `_inject_deterministic_tiebreakers`."""
 
     def test_injects_other_select_columns_and_agg_arg_into_rows_between(self):
         """Verify the other SELECT columns and window input column are added to ORDER BY."""
@@ -346,9 +621,9 @@ class TestDeterministicTiebreakerInjection(unittest.TestCase):
             "ROWS BETWEEN 3 PRECEDING AND 1 FOLLOWING) AS window_column "
             "FROM subject_summary s"
         )
-        rewritten = _inject_window_tiebreakers(sql)
+        rewritten = _inject_deterministic_tiebreakers(sql)
         self.assertIn(
-            "ORDER BY at.academic_year, s.subject_title, s.department_name, s.total_units ROWS BETWEEN",
+            "ORDER BY at.academic_year ASC NULLS LAST, s.subject_title, s.department_name, s.total_units ROWS BETWEEN",
             rewritten,
         )
 
@@ -382,8 +657,8 @@ class TestDeterministicTiebreakerInjection(unittest.TestCase):
             rewritten,
         )
 
-    def test_postgresql_case_insensitive_upper_tiebreaker_alignment(self):
-        """Verify PostgreSQL tie-breaker injection adds UPPER(...) + column for text columns."""
+    def test_postgresql_appended_text_keys_use_byte_order(self):
+        """Appended PostgreSQL text keys sort byte by byte; the query's own key is unchanged."""
         schema_ddl = 'CREATE TABLE "courses" ("id" INT, "dept" VARCHAR(20), "title" VARCHAR(100));'
         sql = (
             'SELECT c."dept", c."title", '
@@ -393,11 +668,159 @@ class TestDeterministicTiebreakerInjection(unittest.TestCase):
         rewritten = _inject_deterministic_tiebreakers(
             sql, dialect="postgresql", schema_ddl=schema_ddl
         )
-        self.assertIn(
-            'UPPER(REPLACE(c."title", \'-\', \' \')) COLLATE "C" ASC NULLS FIRST',
-            rewritten,
-        )
+        self.assertIn('ORDER BY c."dept", ', rewritten)
+        self.assertIn('c."title" COLLATE "C" ASC NULLS FIRST', rewritten)
         self.assertIn('"c"."id" ASC NULLS FIRST', rewritten)
+        self.assertNotIn("UPPER(", rewritten)
+
+
+
+_SQLITE_ROWS = """
+CREATE TABLE emp (id INT, dept TEXT, name TEXT, sal INT, d TEXT);
+INSERT INTO emp VALUES
+  (1,'A','zed',100,'2024-01-01'), (2,'A','amy',100,'2024-01-01'),
+  (3,'A','bob',90,'2024-01-02'), (4,'B','cat',80,'2024-01-01'),
+  (5,'B','dan',80,'2024-01-03'), (6,'B','eve',70,'2024-01-03');
+"""
+_EMP_DDL = "CREATE TABLE emp (id INT, dept VARCHAR(20), name VARCHAR(20), sal INT, d DATE);"
+
+
+class TestTiebreakersNeverCreateFalseMatches(unittest.TestCase):
+    """Two different queries must still give different results after tie-breaking.
+
+    Each case runs both queries on a small SQLite table, before and after
+    `_inject_deterministic_tiebreakers`, and checks that the injection never
+    turns two different results into the same result.
+    """
+
+    def _rows(self, sql):
+        """Runs `sql` on a fresh in-memory table and returns its rows in order."""
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(_SQLITE_ROWS)
+        try:
+            return conn.execute(sql).fetchall()
+        finally:
+            conn.close()
+
+    def _assert_still_different(self, src, dest):
+        """Fails if `src` and `dest` match after tie-breaking (or ever matched)."""
+        self.assertNotEqual(sorted(self._rows(src)), sorted(self._rows(dest)))
+        src_tb = _inject_deterministic_tiebreakers(src, schema_ddl=_EMP_DDL)
+        dest_tb = _inject_deterministic_tiebreakers(dest, schema_ddl=_EMP_DDL)
+        self.assertNotEqual(
+            sorted(self._rows(src_tb)), sorted(self._rows(dest_tb)),
+            msg=f"false match after injection:\n{src_tb}\n{dest_tb}",
+        )
+
+    def test_second_sort_key_is_kept_in_top_n(self):
+        """`sal DESC, name ASC` vs `sal DESC, name DESC` with LIMIT 1 stay different."""
+        self._assert_still_different(
+            "SELECT dept, name, sal FROM emp ORDER BY sal DESC, name ASC LIMIT 1",
+            "SELECT dept, name, sal FROM emp ORDER BY sal DESC, name DESC LIMIT 1",
+        )
+
+    def test_second_sort_key_is_kept_in_row_number(self):
+        """A wrong second key inside ROW_NUMBER() still changes who is ranked 1."""
+        self._assert_still_different(
+            "SELECT * FROM (SELECT name, dept, ROW_NUMBER() OVER (PARTITION BY dept"
+            " ORDER BY sal DESC, name ASC) AS rn FROM emp) t WHERE rn = 1",
+            "SELECT * FROM (SELECT name, dept, ROW_NUMBER() OVER (PARTITION BY dept"
+            " ORDER BY sal DESC, name DESC) AS rn FROM emp) t WHERE rn = 1",
+        )
+
+    def test_running_total_peers_are_not_split(self):
+        """A running SUM over tied dates (peers) vs a ROWS frame stays different."""
+        self._assert_still_different(
+            "SELECT id, sal, SUM(sal) OVER (ORDER BY d) AS run FROM emp",
+            "SELECT id, sal, SUM(sal) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED"
+            " PRECEDING AND CURRENT ROW) AS run FROM emp",
+        )
+
+    def test_running_count_with_extra_key_stays_different(self):
+        """COUNT(*) OVER (ORDER BY d) vs (ORDER BY d, id) stays different."""
+        self._assert_still_different(
+            "SELECT id, COUNT(*) OVER (ORDER BY d) AS c FROM emp",
+            "SELECT id, COUNT(*) OVER (ORDER BY d, id) AS c FROM emp",
+        )
+
+    def test_last_value_default_frame_stays_different(self):
+        """LAST_VALUE with the default frame vs a ROWS frame stays different."""
+        self._assert_still_different(
+            "SELECT id, LAST_VALUE(name) OVER (PARTITION BY dept ORDER BY sal) AS lv FROM emp",
+            "SELECT id, LAST_VALUE(name) OVER (PARTITION BY dept ORDER BY sal ROWS"
+            " BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS lv FROM emp",
+        )
+
+    def test_nulls_last_idiom_second_key_is_kept(self):
+        """`sal IS NULL, sal DESC` vs `sal IS NULL, sal ASC` with LIMIT stay different."""
+        self._assert_still_different(
+            "SELECT name, sal FROM emp ORDER BY sal IS NULL, sal DESC LIMIT 2",
+            "SELECT name, sal FROM emp ORDER BY sal IS NULL, sal ASC LIMIT 2",
+        )
+
+
+class TestWhichWindowsGetTiebreakers(unittest.TestCase):
+    """Tests for `_window_allows_tiebreakers` and the query's own keys staying intact."""
+
+    def test_window_rules(self):
+        """Order-only functions and ROWS frames get keys; peers and ranks do not."""
+        self.assertTrue(_window_allows_tiebreakers("row_number", ""))
+        self.assertTrue(_window_allows_tiebreakers("lag", ""))
+        self.assertTrue(_window_allows_tiebreakers("sum", "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW"))
+        self.assertFalse(_window_allows_tiebreakers("sum", ""))
+        self.assertFalse(_window_allows_tiebreakers("count", "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"))
+        self.assertFalse(_window_allows_tiebreakers("last_value", ""))
+        self.assertFalse(_window_allows_tiebreakers("dense_rank", "ROWS UNBOUNDED PRECEDING"))
+
+    def test_own_sort_keys_are_never_rewritten(self):
+        """The query's own keys come through exactly as written, in both dialects."""
+        sql = "SELECT name, sal FROM emp ORDER BY sal DESC, LOWER(name) ASC LIMIT 3"
+        for dialect in ("mysql", "postgresql"):
+            with self.subTest(dialect=dialect):
+                out = _inject_deterministic_tiebreakers(
+                    sql, dialect=dialect, schema_ddl=_EMP_DDL
+                )
+                self.assertIn("ORDER BY sal DESC, LOWER(name) ASC, ", out)
+
+    def test_running_sum_without_frame_is_left_alone(self):
+        """A plain running total is not changed at all."""
+        sql = "SELECT id, SUM(sal) OVER (ORDER BY d) AS run FROM emp"
+        self.assertEqual(
+            _inject_deterministic_tiebreakers(sql, schema_ddl=_EMP_DDL), sql
+        )
+
+
+class TestTiebreakerRerunNeedsBothQueriesChanged(unittest.TestCase):
+    """`_check_shared_window_tiebreaker` only re-runs when BOTH queries got tie-breakers."""
+
+    def _orchestrator(self):
+        """Builds an orchestrator whose query runners must never be called."""
+        orch = QueryConversionOrchestrator(
+            converter=MySQLToPGQueryConverter(),
+            source_connection={},
+            dest_connection={},
+            source_schema=_EMP_DDL,
+            dest_schema=_EMP_DDL,
+        )
+        orch._execute_source_query = mock.Mock(side_effect=AssertionError("re-ran"))  # pylint: disable=protected-access
+        orch._execute_dest_query = mock.Mock(side_effect=AssertionError("re-ran"))  # pylint: disable=protected-access
+        return orch
+
+    def test_trailing_semicolon_is_not_a_change(self):
+        """A query with nothing to tie-break plus a trailing ';' is not re-run."""
+        ok, reason = self._orchestrator()._check_shared_window_tiebreaker(  # pylint: disable=protected-access
+            "SELECT name FROM emp LIMIT 3;", "SELECT name FROM emp LIMIT 3;"
+        )
+        self.assertFalse(ok)
+        self.assertIn("No deterministic tie-breakers", reason)
+
+    def test_only_one_side_changed_is_not_re_run(self):
+        """If only one of the two queries got tie-breakers, do not re-run."""
+        ok, _ = self._orchestrator()._check_shared_window_tiebreaker(  # pylint: disable=protected-access
+            "SELECT name, sal FROM emp ORDER BY sal DESC LIMIT 3",
+            "SELECT name, sal FROM emp LIMIT 3",
+        )
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

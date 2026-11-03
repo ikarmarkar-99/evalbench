@@ -2,17 +2,18 @@
 
 This module contains:
   - Plain-SQL tie-breaker helpers (`_split_top_level_commas`,
-    `_strip_select_alias`, `_parse_schema_columns`, `_inject_window_tiebreakers`,
-    and `_inject_deterministic_tiebreakers`) that add shared tie-breaker columns
-    to `ORDER BY` clauses when a query has ties, so both the source and
-    converted queries can be compared across 100% of columns without dropping
-    any columns.
+    `_strip_select_alias`, `_parse_schema_columns`, `_window_allows_tiebreakers`
+    and `_inject_deterministic_tiebreakers`) that APPEND the same extra sort
+    columns after a query's own `ORDER BY` keys (never changing or dropping
+    the query's own keys) when its result depends on how ties are broken, so
+    the source and converted queries can be compared across 100% of columns.
   - `QueryConversionOrchestrator`: Runs the iterative conversion loop against
     the source and destination databases.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
+import inspect
 import json
 from pathlib import Path
 import re
@@ -365,133 +366,127 @@ def _format_tie_expr(
     is_text: bool,
     direction: str = "ASC",
 ) -> str:
-    """Format a column for `ORDER BY` so MySQL and PostgreSQL sort values in the exact same order.
+    """Format an extra tie-breaker column so MySQL and PostgreSQL sort it identically.
 
-    MySQL and PostgreSQL have three default sorting differences:
-      1. Empty (`NULL`) values: MySQL puts `NULL`s first on `ASC` and last on `DESC`;
-         PostgreSQL does the opposite unless `NULLS FIRST` / `NULLS LAST` is specified.
-      2. Uppercase vs. lowercase text: MySQL sorts case-insensitively by default,
-         while PostgreSQL sorts capital letters before lowercase letters unless
-         `UPPER(...)` is used.
-      3. Hyphens vs. spaces in text codes: MySQL's default Unicode sorting treats
-         `'-'` and `' '` similarly before uppercase letters, so normalizing `'-'`
-         to `' '` inside `UPPER(REPLACE(...))` keeps text codes aligned.
+    Only used for tie-breaker columns that are APPENDED after the query's own
+    sort keys (the query's own keys are never changed). The goal is simply an
+    order both databases agree on, so:
+      1. Empty (`NULL`) values come first in both databases (MySQL already
+         does this on `ASC`; PostgreSQL needs `NULLS FIRST`).
+      2. Text is compared byte by byte in both databases (`CAST(... AS BINARY)`
+         in MySQL, `COLLATE "C"` in PostgreSQL), so letter case and accents
+         sort the same way everywhere.
 
-    Example (for a numeric column `c.id` in ascending order):
+    Example (for a numeric column `c.id`):
         - MySQL:      `"c.id IS NOT NULL ASC, c.id ASC"`
         - PostgreSQL: `'c."id" ASC NULLS FIRST'`
 
-    Example (for a text column `c.title` in ascending order):
-        - MySQL:      `"c.title IS NOT NULL ASC, CAST(UPPER(REPLACE(c.title, '-', ' ')) AS BINARY) ASC, CAST(c.title AS BINARY) ASC"`
-        - PostgreSQL: `'UPPER(REPLACE(c."title", \'-\', \' \')) COLLATE "C" ASC NULLS FIRST, c."title" COLLATE "C" ASC NULLS FIRST'`
+    Example (for a text column `c.title`):
+        - MySQL:      `"c.title IS NOT NULL ASC, CAST(c.title AS BINARY) ASC"`
+        - PostgreSQL: `'c."title" COLLATE "C" ASC NULLS FIRST'`
 
     Args:
         expr: SQL column or expression to sort by.
         dialect: `"mysql"`, `"postgresql"`, or `""` (plain SQL for unit tests).
-        is_text: True if `expr` is a text column (so `UPPER(...)` is safe to apply).
+        is_text: True if `expr` is a text column (so byte order is applied).
         direction: `"ASC"` (ascending) or `"DESC"` (descending).
 
     Returns:
         Formatted `ORDER BY` item string for the target database dialect.
     """
     # Strip any existing `ASC`, `DESC`, or `NULLS FIRST/LAST` suffix from `expr`.
-    base = re.sub(
-        r"\s*(?:\b(?:ASC|DESC)\b|\bNULLS\s+(?:FIRST|LAST)\b)\s*$",
-        "",
-        expr.strip(),
-        flags=re.IGNORECASE,
-    ).strip()
-    base = re.sub(
-        r"\s*(?:\b(?:ASC|DESC)\b|\bNULLS\s+(?:FIRST|LAST)\b)\s*$",
-        "",
-        base,
-        flags=re.IGNORECASE,
-    ).strip()
+    base = expr.strip()
+    for _ in range(2):
+        base = re.sub(
+            r"\s*(?:\b(?:ASC|DESC)\b|\bNULLS\s+(?:FIRST|LAST)\b)\s*$",
+            "",
+            base,
+            flags=re.IGNORECASE,
+        ).strip()
+    direction = direction.upper()
     if not dialect:
-        return base if direction.upper() == "ASC" else f"{base} DESC"
+        return base if direction == "ASC" else f"{base} DESC"
 
     has_collate = "COLLATE" in base.upper()
-    direction = direction.upper()
     if dialect == "mysql":
+        nulls = "IS NOT NULL ASC" if direction == "ASC" else "IS NULL ASC"
         if is_text and not has_collate:
-            if direction == "ASC":
-                return (
-                    f"{base} IS NOT NULL ASC, "
-                    f"CAST(UPPER(REPLACE({base}, '-', ' ')) AS BINARY) ASC, "
-                    f"CAST({base} AS BINARY) ASC"
-                )
-            return (
-                f"{base} IS NULL ASC, "
-                f"CAST(UPPER(REPLACE({base}, '-', ' ')) AS BINARY) DESC, "
-                f"CAST({base} AS BINARY) DESC"
-            )
-        if direction == "ASC":
-            return f"{base} IS NOT NULL ASC, {base} ASC"
-        return f"{base} IS NULL ASC, {base} DESC"
+            return f"{base} {nulls}, CAST({base} AS BINARY) {direction}"
+        return f"{base} {nulls}, {base} {direction}"
 
-    # PostgreSQL formatting: match MySQL's NULL placement and case-insensitive text order.
+    # PostgreSQL: same NULL placement as MySQL, byte order for text.
+    nulls = "NULLS FIRST" if direction == "ASC" else "NULLS LAST"
     if is_text and not has_collate:
-        if direction == "ASC":
-            return (
-                f'UPPER(REPLACE({base}, \'-\', \' \')) COLLATE "C" ASC NULLS FIRST, '
-                f'{base} COLLATE "C" ASC NULLS FIRST'
-            )
-        return (
-            f'UPPER(REPLACE({base}, \'-\', \' \')) COLLATE "C" DESC NULLS LAST, '
-            f'{base} COLLATE "C" DESC NULLS LAST'
-        )
-    if direction == "ASC":
-        return f"{base} ASC NULLS FIRST"
-    return f"{base} DESC NULLS LAST"
+        return f'{base} COLLATE "C" {direction} {nulls}'
+    return f"{base} {direction} {nulls}"
 
 
-def _extract_key_dir(expr: str) -> Tuple[str, str]:
-    """Split an `ORDER BY` item into its column name and sort direction (`ASC` or `DESC`).
+# Window functions whose result depends only on the ORDER of rows (not on a
+# frame of "peer" rows), so adding tie-breaker keys only settles ties.
+_ORDER_ONLY_WINDOW_FUNCS = frozenset(
+    {"row_number", "ntile", "lag", "lead", "first_value"}
+)
+# Window functions where tied rows must keep sharing a value; never touched.
+_SHARED_TIE_WINDOW_FUNCS = frozenset(
+    {"rank", "dense_rank", "percent_rank", "cume_dist"}
+)
+
+
+def _window_function_name(prefix: str) -> str:
+    """Returns the lower-case name of the function right before `OVER`.
 
     Example:
-        Input:  `'UPPER(t1."dept") COLLATE "C" DESC NULLS LAST'`
-        Output: `('t1."dept"', 'DESC')`
+        Input:  `"SELECT a, SUM(s.x) "` (the text before `OVER (...)`)
+        Output: `"sum"`
 
     Args:
-        expr: A single item from an `ORDER BY` clause.
+        prefix: The SQL text that ends just before an `OVER` keyword.
 
     Returns:
-        Tuple of `(column_expression, direction)` where `direction` is `'ASC'` or `'DESC'`.
+        The function name, or `""` if the text does not end in `name(...)`.
     """
-    s = expr.strip()
-    # Check if the item ends with `ASC` or `DESC` (optionally followed by `NULLS FIRST/LAST`).
-    dir_m = re.search(
-        r"\b(ASC|DESC)\b(?:\s+NULLS\s+(?:FIRST|LAST))?\s*$",
-        s,
-        flags=re.IGNORECASE,
-    )
-    direction = dir_m.group(1).upper() if dir_m else "ASC"
-    # Remove trailing `ASC`/`DESC`, `NULLS FIRST/LAST`, `COLLATE ...`, and `UPPER(...)`/`LOWER(...)`
-    # wrappers so we get the clean underlying column expression.
-    base = re.sub(
-        r"\s*(?:\b(?:ASC|DESC)\b|\bNULLS\s+(?:FIRST|LAST)\b)\s*$",
-        "",
-        s,
-        flags=re.IGNORECASE,
-    ).strip()
-    base = re.sub(
-        r"\s*(?:\b(?:ASC|DESC)\b|\bNULLS\s+(?:FIRST|LAST)\b)\s*$",
-        "",
-        base,
-        flags=re.IGNORECASE,
-    ).strip()
-    base = re.sub(
-        r"\s+\bCOLLATE\s+(?:\"[^\"]+\"|'[^']+'|\w+)\s*$",
-        "",
-        base,
-        flags=re.IGNORECASE,
-    ).strip()
-    lu_m = re.match(
-        r"^(?:LOWER|UPPER)\s*\((.*)\)$", base, flags=re.IGNORECASE | re.DOTALL
-    )
-    if lu_m:
-        base = lu_m.group(1).strip()
-    return base, direction
+    s = prefix.rstrip()
+    if not s.endswith(")"):
+        return ""
+    depth = 0
+    for i in range(len(s) - 1, -1, -1):
+        if s[i] == ")":
+            depth += 1
+        elif s[i] == "(":
+            depth -= 1
+            if depth == 0:
+                m = re.search(r"(\w+)\s*$", s[:i])
+                return m.group(1).lower() if m else ""
+    return ""
+
+
+def _window_allows_tiebreakers(func_name: str, frame: str) -> bool:
+    """Whether adding tie-breaker keys to this window keeps its meaning.
+
+    Adding keys is safe only when ties merely make the order ambiguous:
+      - `ROW_NUMBER`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE` with no frame
+        clause (their value depends only on row order).
+      - Any function except the RANK family with an explicit `ROWS` frame
+        (the frame counts physical rows, so ties only change which row is
+        where).
+    It is NOT safe for running totals and similar (`SUM`, `COUNT`, `AVG`,
+    `LAST_VALUE`, ...) without a frame or with a `RANGE`/`GROUPS` frame: there,
+    tied rows are "peers" that share one value, and extra keys would give each
+    row its own value instead.
+
+    Args:
+        func_name: Lower-case window function name (from `_window_function_name`).
+        frame: The frame clause text after the window's ORDER BY (may be empty).
+
+    Returns:
+        True if tie-breaker keys may be appended.
+    """
+    if func_name in _SHARED_TIE_WINDOW_FUNCS:
+        return False
+    frame = frame.strip().upper()
+    if frame:
+        return frame.startswith("ROWS")
+    return func_name in _ORDER_ONLY_WINDOW_FUNCS
 
 
 def _extract_cte_columns(
@@ -637,9 +632,6 @@ def _inject_tiebreakers_in_select(
     table_key_exprs: List[Tuple[str, bool]] = []
     q = "`" if dialect == "mysql" else ('"' if dialect == "postgresql" else "")
     has_bare_star = bool(re.match(r"^\s*\*\s*$", select_body))
-    has_any_star = bool(
-        re.match(r"^\s*(?:[`\"]?\w+[`\"]?\.)?\*\s*(?:,|$)", select_body)
-    )
 
     # Find each table name and its optional nickname (alias) in `FROM table alias JOIN table2 alias2`.
     t_pat = re.compile(
@@ -760,17 +752,7 @@ def _inject_tiebreakers_in_select(
                 out.append(s_body[i:])
                 break
             prefix_before_over = s_body[i : i + over_m.start()]
-            # Do NOT add tie-breakers to `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`,
-            # or `CUME_DIST()`, because tied rows in those functions are supposed to
-            # receive the exact same rank number (adding unique tie-breakers would
-            # turn `DENSE_RANK()` into `ROW_NUMBER()`).
-            is_shared_tie_rank = bool(
-                re.search(
-                    r"\b(?:DENSE_RANK|RANK|PERCENT_RANK|CUME_DIST)\s*\(\s*\)\s*$",
-                    prefix_before_over,
-                    flags=re.IGNORECASE,
-                )
-            )
+            func_name = _window_function_name(prefix_before_over)
             out.append(s_body[i : open_p + 1])
             over_inner = s_body[open_p + 1 : close_p]
             # Find the `ORDER BY ...` list inside `OVER (...)`, stopping before `ROWS`/`RANGE`/`GROUPS`.
@@ -779,41 +761,12 @@ def _inject_tiebreakers_in_select(
                 over_inner,
                 flags=re.IGNORECASE | re.DOTALL,
             )
-            if ob_m and not is_shared_tie_rank:
-                ob_keys = _split_top_level_commas(ob_m.group(1).strip())
-                first_k_clean = (
-                    _extract_key_dir(ob_keys[0])[0].strip('`"').lower()
-                    if ob_keys
-                    else ""
-                )
-                # Keep the query's primary sort key (or 3-part date sort keys ending in `_sort`,
-                # or 2-part sort keys ending in `_sort` when the 2nd key starts with `min_`/`max_`),
-                # then append the shared tie-breaker columns so both MySQL and PostgreSQL
-                # break ties on the primary key in the exact same order.
-                second_k_clean = (
-                    _extract_key_dir(ob_keys[1])[0].strip('`"').lower()
-                    if len(ob_keys) >= 2
-                    else ""
-                )
-                if first_k_clean.endswith("_sort") and len(ob_keys) >= 3 and second_k_clean.endswith("_sort"):
-                    kept_keys = ob_keys[:3]
-                elif first_k_clean.endswith("_sort") and len(ob_keys) >= 2 and second_k_clean.startswith(("min_", "max_")):
-                    kept_keys = ob_keys[:2]
-                elif not candidate_ties:
-                    kept_keys = ob_keys
-                else:
-                    kept_keys = ob_keys[:1]
-                primary_formatted = []
-                for k in kept_keys:
-                    bk, dk = _extract_key_dir(k)
-                    is_tk = _is_expr_text_col(
-                        bk, alias_to_table, schema_tables, pure_text_cols
-                    )
-                    primary_formatted.append(
-                        _format_tie_expr(bk, dialect, is_tk, dk)
-                    )
-                all_ob = primary_formatted + formatted_ties
-                new_ob = "ORDER BY " + ", ".join(all_ob)
+            frame = over_inner[ob_m.end() :] if ob_m else ""
+            if ob_m and _window_allows_tiebreakers(func_name, frame):
+                # Keep every one of the query's own sort keys exactly as written
+                # and only append the shared tie-breaker columns after them.
+                original_ob = ob_m.group(1).strip()
+                new_ob = "ORDER BY " + ", ".join([original_ob] + formatted_ties)
                 over_inner = (
                     over_inner[: ob_m.start()]
                     + new_ob
@@ -837,46 +790,13 @@ def _inject_tiebreakers_in_select(
     )
     has_limit = bool(re.search(r"\bLIMIT\b", tail_masked, flags=re.IGNORECASE))
     has_user_var = ":=" in select_body
-    is_star_cte_order = (
-        dialect == "mysql"
-        and has_bare_star
-        and bool(table_key_exprs)
-        and not has_limit
-    )
-    if ob_tail_m and (has_limit or has_user_var or is_star_cte_order):
+    # Only a top-N (`ORDER BY ... LIMIT`) or a MySQL `@rank :=` ranking needs
+    # tie-breakers here: without LIMIT, Check 2 already accepts tied rows in
+    # either order, so the query is left alone.
+    if ob_tail_m and (has_limit or has_user_var):
+        # Keep every one of the query's own sort keys exactly as written.
         raw_ob_body = tail_segment[ob_tail_m.start(1) : ob_tail_m.end(1)].strip()
-        ob_keys = _split_top_level_commas(raw_ob_body)
-        kept_count = (
-            2
-            if (has_user_var or is_star_cte_order) and len(ob_keys) >= 2
-            else 1
-        )
-        kept_keys = ob_keys[:kept_count]
-        # Build alias-to-expression map so `ORDER BY alias` on a `GROUP BY` query
-        # uses the underlying aggregate expression (`MAX(...)`, `SUM(...)`, `COUNT(...)`)
-        # when adding `IS NULL ASC` in MySQL `ONLY_FULL_GROUP_BY` mode.
-        select_alias_map: Dict[str, str] = {}
-        for item in items:
-            item_s = item.strip()
-            item_masked = _mask_parens_and_strings(item_s)
-            as_m = re.search(
-                r"\bAS\s+([`\"]?\w+[`\"]?)\s*$",
-                item_masked,
-                flags=re.IGNORECASE,
-            )
-            if as_m:
-                al = item_s[as_m.start(1) : as_m.end(1)].strip('`"').lower()
-                select_alias_map[al] = item_s[: as_m.start()].strip()
-        primary_formatted = []
-        for k in kept_keys:
-            bk, dk = _extract_key_dir(k)
-            bk_lookup = bk.strip('`"').lower()
-            if has_group_by and bk_lookup in select_alias_map:
-                bk = select_alias_map[bk_lookup]
-            is_tk = _is_expr_text_col(
-                bk, alias_to_table, schema_tables, pure_text_cols
-            )
-            primary_formatted.append(_format_tie_expr(bk, dialect, is_tk, dk))
+        primary_formatted = [raw_ob_body]
         tail_ties = []
         if not has_group_by:
             tail_ties = [
@@ -914,8 +834,6 @@ def _inject_tiebreakers_in_select(
             )
         all_ob = primary_formatted + tail_ties
         new_ob_clause = "ORDER BY " + ", ".join(all_ob)
-        if is_star_cte_order:
-            new_ob_clause += " LIMIT 18446744073709551615"
         tail_segment = (
             tail_segment[: ob_tail_m.start()]
             + new_ob_clause
@@ -928,6 +846,11 @@ def _inject_tiebreakers_in_select(
         + block_sql[from_m.start() : from_end_idx]
         + tail_segment
     )
+
+
+def _trim_sql(sql: str) -> str:
+    """Strips surrounding spaces and a trailing `;` (as the injector does)."""
+    return sql.strip().rstrip(";").strip()
 
 
 def _inject_deterministic_tiebreakers(
@@ -957,7 +880,7 @@ def _inject_deterministic_tiebreakers(
     Returns:
         SQL query string with shared tie-breaker columns added to its `ORDER BY` clauses.
     """
-    clean_sql = sql.strip().rstrip(";").strip()
+    clean_sql = _trim_sql(sql)
     schema_tables, pure_text_cols = _parse_schema_columns(schema_ddl)
     cte_tables = _extract_cte_columns(clean_sql, pure_text_cols)
 
@@ -1012,27 +935,6 @@ def _inject_deterministic_tiebreakers(
         return combined
 
     return process_rec(clean_sql)
-
-
-def _inject_window_tiebreakers(
-    sql: str,
-    dialect: str = "",
-    schema_ddl: str = "",
-) -> str:
-    """Alias for `_inject_deterministic_tiebreakers` kept for unit-test compatibility.
-
-    Args:
-        sql: Original or converted SQL query string.
-        dialect: Optional SQL dialect (`"mysql"`, `"postgresql"`, or `""`).
-        schema_ddl: Optional database table definition text (`CREATE TABLE ...`)
-            listing each table's column names and types (text vs. number/date).
-
-    Returns:
-        SQL query string with shared tie-breaker columns added to its `ORDER BY` clauses.
-    """
-    return _inject_deterministic_tiebreakers(
-        sql, dialect=dialect, schema_ddl=schema_ddl
-    )
 
 
 class QueryConversionOrchestrator:
@@ -1186,8 +1088,8 @@ class QueryConversionOrchestrator:
                         allow_tie_eq = getattr(
                             self.converter, 'allow_tie_equivalence', False
                         )
-                        matches, match_reason = self.converter.compare_results(
-                            source_result, dest_result
+                        matches, match_reason = self._compare(
+                            source_result, dest_result, source_query
                         )
                         if (
                             not matches
@@ -1414,15 +1316,21 @@ class QueryConversionOrchestrator:
             dialect=self.converter.dest_dialect,
             schema_ddl=schema_ddl,
         )
-        # If neither query had any `OVER (... ORDER BY ...)` or `ORDER BY ... LIMIT`
-        # clause to add tie-breakers to, there is nothing to re-run.
-        if src_tb == source_query and dest_tb == converted_query:
-            return False, "No deterministic tie-breakers injected"
+        # Both queries must actually have received tie-breakers. The injector
+        # trims spaces and a trailing ";", so compare against the trimmed text;
+        # otherwise an unchanged query would just be re-run and could match by
+        # luck (e.g. LIMIT without ORDER BY).
+        src_changed = src_tb != _trim_sql(source_query)
+        dest_changed = dest_tb != _trim_sql(converted_query)
+        if not (src_changed and dest_changed):
+            return False, "No deterministic tie-breakers injected into both queries"
         r_src = self._execute_source_query(src_tb)
         r_dest = self._execute_dest_query(dest_tb)
         if r_src.error or r_dest.error:
             return False, "Tie-broken query execution failed"
-        ok, reason = self.converter.compare_results(r_src, r_dest)
+        # Use the original source query, whose ORDER BY keys set the order the
+        # re-run results must keep.
+        ok, reason = self._compare(r_src, r_dest, source_query)
         if ok:
             return (
                 True,
@@ -1430,6 +1338,25 @@ class QueryConversionOrchestrator:
             )
         return False, reason
     
+    def _compare(
+        self,
+        source_result: QueryResult,
+        dest_result: QueryResult,
+        source_query: str,
+    ) -> Tuple[bool, str]:
+        """Calls the converter's `compare_results`, passing `source_query` if it takes one.
+
+        Converters that can check row order against the source query's ORDER BY
+        (such as `MySQLToPGQueryConverter`) accept a `source_query` argument;
+        all existing converters are called exactly as before.
+        """
+        params = inspect.signature(self.converter.compare_results).parameters
+        if "source_query" in params:
+            return self.converter.compare_results(
+                source_result, dest_result, source_query=source_query
+            )
+        return self.converter.compare_results(source_result, dest_result)
+
     def _execute_dest_query(self, query: str) -> QueryResult:
         """Execute query on destination database."""
         if self.converter.dest_dialect == 'postgresql':
