@@ -273,8 +273,21 @@ class MySQLToPGQueryConverter(QueryConverter):
 2. **Type Casting**: Use PostgreSQL casting
    - MySQL: CAST(x AS REAL) → PostgreSQL: x::DOUBLE PRECISION
 
-3. **NULL Handling**: PostgreSQL requires explicit NULLS FIRST/LAST in ORDER BY
-   - MySQL: ORDER BY column ASC → PostgreSQL: ORDER BY column ASC NULLS LAST
+3. **NULL Handling**: MySQL puts NULLs FIRST on ASC and LAST on DESC; PostgreSQL does the opposite by default
+   - MySQL: ORDER BY column ASC → PostgreSQL: ORDER BY column ASC NULLS FIRST
+   - MySQL: ORDER BY column DESC → PostgreSQL: ORDER BY column DESC NULLS LAST
+
+3b. **Text Sort Order**: MySQL's text order differs from PostgreSQL's default, which ignores spaces and
+   punctuation (MySQL: 'Adv Comp' < 'Advanced', 'D-Lab' < 'Defects'; PostgreSQL default: the reverse).
+   When sorting by a text column (in a final ORDER BY or inside OVER (... ORDER BY ...)), pick the
+   PostgreSQL sort expression from the MySQL table's collation shown in the source schema:
+   - `COLLATE=utf8mb4_0900_ai_ci` (or any `utf8mb4_0900_*`) or `*_unicode_ci`:
+     MySQL: ORDER BY title → PostgreSQL: ORDER BY "title" COLLATE "und-x-icu" ASC NULLS FIRST
+   - `*_general_ci`, or a table with only `DEFAULT CHARSET=utf8mb3` / `latin1` and no COLLATE
+     (their default collations are `utf8mb3_general_ci` / `latin1_swedish_ci`):
+     MySQL: ORDER BY title → PostgreSQL: ORDER BY UPPER("title") COLLATE "C" ASC NULLS FIRST
+   - Only for text columns (COLLATE on a number column is an error). Do not use ctid or
+     hand-written CASE overrides to imitate MySQL's order of tied rows; tied rows may come in any order.
 
 4. **Division**: PostgreSQL integer division returns integer
    - MySQL: col1 / col2 (auto-converts to REAL)

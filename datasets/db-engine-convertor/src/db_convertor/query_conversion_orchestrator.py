@@ -414,10 +414,14 @@ def _format_tie_expr(
             return f"{base} {nulls}, CAST({base} AS BINARY) {direction}"
         return f"{base} {nulls}, {base} {direction}"
 
-    # PostgreSQL: same NULL placement as MySQL, byte order for text.
+    # PostgreSQL: same NULL placement as MySQL, byte order for text. The value
+    # is cast to text first so a column wrongly guessed to be text (e.g. a
+    # helper-table column `min_id` that is really a number) still runs instead
+    # of failing with "collations are not supported by type integer"; both
+    # databases then sort it as text the same way.
     nulls = "NULLS FIRST" if direction == "ASC" else "NULLS LAST"
     if is_text and not has_collate:
-        return f'{base} COLLATE "C" {direction} {nulls}'
+        return f'CAST({base} AS TEXT) COLLATE "C" {direction} {nulls}'
     return f"{base} {direction} {nulls}"
 
 
@@ -510,6 +514,8 @@ def _extract_cte_columns(
         Mapping from lowercase helper table (CTE) name to `[(column_name, is_text), ...]`.
     """
     cte_map: Dict[str, List[Tuple[str, bool]]] = {}
+    # Helper-table names defined more than once in the query (their columns are skipped).
+    ambiguous: Set[str] = set()
     # Match `cte_name AS (` headers in `WITH ...` blocks.
     cte_re = re.compile(
         r"([`\"]?\w+[`\"]?)\s+AS\s+(?:(?:NOT\s+)?MATERIALIZED\s+)?\(",
@@ -560,7 +566,16 @@ def _extract_cte_columns(
                 col_l = out_col.lower()
                 cols.append((out_col, col_l in pure_text_cols))
         if cols:
-            cte_map[cname] = cols
+            if cname in cte_map or cname in ambiguous:
+                # The same helper-table name is defined more than once (e.g. two
+                # nested `WITH inner_cte AS (...)` blocks). Which definition a
+                # later `FROM inner_cte` means depends on where it sits, so its
+                # columns are not used at all rather than risk naming a column
+                # that does not exist there.
+                ambiguous.add(cname)
+                cte_map.pop(cname, None)
+            else:
+                cte_map[cname] = cols
     return cte_map
 
 

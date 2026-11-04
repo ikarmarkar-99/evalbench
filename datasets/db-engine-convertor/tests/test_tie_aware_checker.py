@@ -669,9 +669,38 @@ class TestDeterministicTiebreakerInjection(unittest.TestCase):
             sql, dialect="postgresql", schema_ddl=schema_ddl
         )
         self.assertIn('ORDER BY c."dept", ', rewritten)
-        self.assertIn('c."title" COLLATE "C" ASC NULLS FIRST', rewritten)
+        self.assertIn('CAST(c."title" AS TEXT) COLLATE "C" ASC NULLS FIRST', rewritten)
         self.assertIn('"c"."id" ASC NULLS FIRST', rewritten)
         self.assertNotIn("UPPER(", rewritten)
+
+    def test_postgresql_text_key_on_number_column_still_runs(self):
+        """A helper column wrongly guessed to be text (`min_instance_id`) is cast to text, not given COLLATE directly."""
+        schema_ddl = 'CREATE TABLE "instances" ("id" INT, "instance_id" VARCHAR(36));'
+        sql = (
+            'SELECT ic."name", ic."min_instance_id", '
+            'LAG(ic."name") OVER (ORDER BY ic."name") AS prev '
+            'FROM ic_table ic'
+        )
+        rewritten = _inject_deterministic_tiebreakers(
+            sql, dialect="postgresql", schema_ddl=schema_ddl
+        )
+        self.assertIn('CAST(ic."min_instance_id" AS TEXT) COLLATE "C"', rewritten)
+        self.assertNotIn('ic."min_instance_id" COLLATE', rewritten)
+
+    def test_repeated_helper_table_name_columns_are_not_used(self):
+        """Two `WITH inner_cte` blocks with different columns: neither one's columns are borrowed."""
+        sql = (
+            "WITH a AS (WITH inner_cte AS (SELECT t.x, t.y FROM t) "
+            "SELECT x, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM inner_cte), "
+            "b AS (WITH inner_cte AS (SELECT u.z FROM u) SELECT z FROM inner_cte) "
+            "SELECT * FROM a JOIN b ON a.x = b.z"
+        )
+        rewritten = _inject_deterministic_tiebreakers(sql, dialect="mysql")
+        # Before the fix, `inner_cte.z` (from the second definition) was added
+        # to the first block, where no such column exists.
+        self.assertNotIn("inner_cte.z", rewritten)
+        self.assertNotIn("inner_cte.y", rewritten)
+        self.assertIn("ROW_NUMBER() OVER (ORDER BY x, x IS NOT NULL ASC, x ASC)", rewritten)
 
 
 
