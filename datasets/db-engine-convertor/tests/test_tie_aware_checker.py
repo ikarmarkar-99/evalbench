@@ -962,3 +962,20 @@ class TestTiebreakerRerunGuards(unittest.TestCase):
         self.assertIn('"a"."id" ASC NULLS FIRST', out)
         out = _inject_deterministic_tiebreakers("SELECT a.x, b.y FROM a, b WHERE a.id = b.id ORDER BY a.x LIMIT 1", "mysql", ddl)
         self.assertIn("`b`.`y`", out)
+
+
+class TestSameResultTieRule(unittest.TestCase):
+    """Tests for how two sort keys from the SAME result are judged tied."""
+
+    def test_computed_decimals_tie_but_stored_amounts_do_not(self):
+        """Verify float-noise ties still count as ties while real differences do not."""
+        same = MySQLToPGQueryConverter._same_number
+        # MySQL doubles for two equal variances differ in the 15th digit; PostgreSQL numerics are equal.
+        self.assertTrue(same(11.900826446280995, 11.900826446280991))
+        self.assertTrue(same(decimal.Decimal("0.1234567890123460"), decimal.Decimal("0.1234567890123450")))
+        # Real differences, however small the gap looks, stay apart.
+        self.assertFalse(same(decimal.Decimal("98765432.10"), decimal.Decimal("98765432.11")))
+        self.assertFalse(same(decimal.Decimal("0.5"), decimal.Decimal("0.49")))
+        self.assertFalse(same(decimal.Decimal("0.49826989619377162630"), decimal.Decimal("0")))
+        self.assertFalse(same(1700000000000, 1700000001000))
+        self.assertTrue(same(1, decimal.Decimal("1.0")))

@@ -681,12 +681,16 @@ Output your decision now:
         """True if MySQL would treat two sort-key values as tied.
 
         Within one result (`src_vs_dest=False`) two keys are tied only when
-        they are exactly equal: numbers by value (`1` and `1.0` tie,
-        `98765432.10` and `98765432.11` do not) and text byte for byte, except
-        that MySQL's default `_ci` collations ignore letter case, so text is
-        lower-cased first when `case_insensitive` is True. When comparing a
-        MySQL key (`val1`) with a PostgreSQL key (`val2`, `src_vs_dest=True`),
-        numbers follow the rules of `_numbers_match`.
+        they are the same value: whole numbers exactly (`1` and `1.0` tie),
+        exact decimals once both are rounded to the fewer of their decimal
+        places or 9 places (so money amounts `98765432.10` and `98765432.11`
+        do not tie, while two computed averages that only differ in the 15th
+        decimal do), floating-point values to one part in a billion, and text
+        byte for byte, except that MySQL's default `_ci` collations ignore
+        letter case, so text is lower-cased first when `case_insensitive` is
+        True. When comparing a MySQL key (`val1`) with a PostgreSQL key
+        (`val2`, `src_vs_dest=True`), numbers follow the rules of
+        `_numbers_match`.
         """
         if val1 is None or val2 is None:
             return val1 is None and val2 is None
@@ -695,14 +699,43 @@ Output your decision now:
             if num1 is not None and num2 is not None:
                 if src_vs_dest:
                     return cls._numbers_match(num1, num2, val1, _ABS_TOL)
-                try:
-                    return decimal.Decimal(str(num1)) == decimal.Decimal(str(num2))
-                except decimal.InvalidOperation:
-                    return False
+                return cls._same_number(num1, num2)
         s1, s2 = str(val1), str(val2)
         if case_insensitive:
             s1, s2 = s1.lower(), s2.lower()
         return s1 == s2
+
+    @classmethod
+    def _same_number(cls, num1: Any, num2: Any) -> bool:
+        """True if two numbers from the SAME result are the same sort key.
+
+        Whole numbers must be equal exactly, and a whole number never ties
+        with a non-whole one. If either is a float, they must agree to one
+        part in a billion. Two exact decimals are both rounded to 9 decimal
+        places and must then be equal, so stored amounts (`98765432.10` vs
+        `98765432.11`, `0.5` vs `0.49`) compare exactly while long computed
+        decimals that only differ far after the ninth place tie.
+        """
+        whole1, whole2 = cls._is_whole(num1), cls._is_whole(num2)
+        if whole1 and whole2:
+            return int(num1) == int(num2)
+        if isinstance(num1, float) or isinstance(num2, float):
+            f1, f2 = float(num1), float(num2)
+            if math.isnan(f1) or math.isnan(f2):
+                return math.isnan(f1) and math.isnan(f2)
+            return math.isclose(f1, f2, rel_tol=_REL_TOL, abs_tol=_ABS_TOL)
+        try:
+            d1, d2 = decimal.Decimal(str(num1)), decimal.Decimal(str(num2))
+            if whole1 or whole2:
+                # A whole number only ties with the exact same value (`1` and
+                # `1.0`), never with `0.498...` rounded down.
+                return d1 == d2
+            unit = decimal.Decimal(1).scaleb(-9)
+            return d1.quantize(unit, rounding=decimal.ROUND_HALF_UP) == d2.quantize(
+                unit, rounding=decimal.ROUND_HALF_UP
+            )
+        except decimal.InvalidOperation:
+            return False
 
     @staticmethod
     def _as_number(val: Any) -> Optional[Any]:
