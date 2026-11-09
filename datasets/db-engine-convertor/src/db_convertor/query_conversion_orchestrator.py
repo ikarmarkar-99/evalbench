@@ -26,6 +26,7 @@ from .query_converters.base import (
     QueryResult,
 )
 from .query_executor import QueryExecutor
+from .query_converters.mysql_to_pg import _mask_sql, _top_level_order_keys
 from .utils.llm import gemini_inference
 
 
@@ -449,7 +450,9 @@ def _window_function_name(prefix: str) -> str:
     Returns:
         The function name, or `""` if the text does not end in `name(...)`.
     """
-    s = prefix.rstrip()
+    # Blank out string literals first so a `(` inside `'lag('` does not
+    # throw off the parenthesis count (the masked text keeps every position).
+    s = _mask_sql(prefix, mask_parens=False).rstrip()
     if not s.endswith(")"):
         return ""
     depth = 0
@@ -648,9 +651,10 @@ def _inject_tiebreakers_in_select(
     q = "`" if dialect == "mysql" else ('"' if dialect == "postgresql" else "")
     has_bare_star = bool(re.match(r"^\s*\*\s*$", select_body))
 
-    # Find each table name and its optional nickname (alias) in `FROM table alias JOIN table2 alias2`.
+    # Find each table name and its optional nickname (alias) in
+    # `FROM table alias JOIN table2 alias2` or `FROM table alias, table2 alias2`.
     t_pat = re.compile(
-        r"(?:^\s*|\bJOIN\s+)([`\"]?\w+[`\"]?)(?:\s+(?:AS\s+)?([`\"]?\w+[`\"]?))?",
+        r"(?:^\s*|\bJOIN\s+|,\s*)([`\"]?\w+[`\"]?)(?:\s+(?:AS\s+)?([`\"]?\w+[`\"]?))?",
         re.IGNORECASE,
     )
     for tm in t_pat.finditer(from_body_masked):
@@ -803,7 +807,9 @@ def _inject_tiebreakers_in_select(
         tail_masked,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    has_limit = bool(re.search(r"\bLIMIT\b", tail_masked, flags=re.IGNORECASE))
+    has_limit = bool(
+        re.search(r"\b(?:LIMIT|FETCH)\b", tail_masked, flags=re.IGNORECASE)
+    )
     has_user_var = ":=" in select_body
     # Only a top-N (`ORDER BY ... LIMIT`) or a MySQL `@rank :=` ranking needs
     # tie-breakers here: without LIMIT, Check 2 already accepts tied rows in
@@ -866,6 +872,77 @@ def _inject_tiebreakers_in_select(
 def _trim_sql(sql: str) -> str:
     """Strips surrounding spaces and a trailing `;` (as the injector does)."""
     return sql.strip().rstrip(";").strip()
+
+
+def _window_order_key_counts(sql: str) -> List[int]:
+    """Number of sort keys inside each `OVER (... ORDER BY ...)`, in text order.
+
+    Example:
+        Input:  `"SELECT ROW_NUMBER() OVER (PARTITION BY d ORDER BY s, n) FROM t"`
+        Output: `[2]`
+
+    Args:
+        sql: A SQL query.
+
+    Returns:
+        One count per window that has an ORDER BY (0 for a window without one).
+    """
+    counts = []
+    masked = _mask_sql(sql, mask_parens=False)
+    for over_m in re.finditer(r"\bOVER\s*\(", masked, flags=re.IGNORECASE):
+        open_p = over_m.end() - 1
+        close_p = _find_matching_paren(masked, open_p)
+        if close_p == -1:
+            continue
+        inner = sql[open_p + 1 : close_p]
+        ob_m = re.search(
+            r"\bORDER\s+BY\s+(.*?)(?=\s+\b(?:ROWS|RANGE|GROUPS)\b|$)",
+            _mask_sql(inner, mask_parens=False),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not ob_m:
+            counts.append(0)
+            continue
+        counts.append(len(_split_top_level_commas(inner[ob_m.start(1) : ob_m.end(1)])))
+    return counts
+
+
+def _missing_sort_keys(source_query: str, converted_query: str) -> str:
+    """Explains which sort keys the converted query dropped, or `""` if none.
+
+    The tie-breaker re-run appends extra keys after each query's own sort
+    keys. If the converted query has fewer keys than the source query in its
+    top-level `ORDER BY` (or in a window `ORDER BY`), the appended keys could
+    quietly fill in for the missing one and make a wrong query pass, so the
+    re-run is refused.
+
+    Example:
+        Source `... ORDER BY sal DESC, name LIMIT 1`, converted
+        `... ORDER BY sal DESC LIMIT 1` -> `"converted query has 1 top-level
+        ORDER BY key(s), source has 2"`.
+
+    Args:
+        source_query: The source (MySQL) query.
+        converted_query: The candidate (PostgreSQL) query.
+
+    Returns:
+        A short reason, or an empty string when nothing is missing.
+    """
+    src_keys = _top_level_order_keys(source_query) or []
+    dest_keys = _top_level_order_keys(converted_query) or []
+    if len(dest_keys) < len(src_keys):
+        return (
+            f"converted query has {len(dest_keys)} top-level ORDER BY key(s), "
+            f"source has {len(src_keys)}"
+        )
+    src_win = _window_order_key_counts(source_query)
+    dest_win = _window_order_key_counts(converted_query)
+    # Windows can only be lined up when both queries have the same number.
+    if len(src_win) == len(dest_win):
+        for i, (s, d) in enumerate(zip(src_win, dest_win), 1):
+            if d < s:
+                return f"converted query's window {i} has {d} ORDER BY key(s), source has {s}"
+    return ""
 
 
 def _inject_deterministic_tiebreakers(
@@ -1321,6 +1398,13 @@ class QueryConversionOrchestrator:
             Tuple of `(matches, reason)` after running both queries with shared tie-breakers.
         """
         schema_ddl = self.dest_schema or self.source_schema or ""
+        # The appended tie-breakers must never stand in for a sort key the
+        # converted query forgot: its top-level ORDER BY (and each of its
+        # window ORDER BYs, in order) must have at least as many keys as the
+        # source query's.
+        missing = _missing_sort_keys(source_query, converted_query)
+        if missing:
+            return False, missing
         src_tb = _inject_deterministic_tiebreakers(
             source_query,
             dialect=self.converter.source_dialect,

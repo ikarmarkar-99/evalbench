@@ -854,3 +854,111 @@ class TestTiebreakerRerunNeedsBothQueriesChanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStrictTiesAndExactValues(unittest.TestCase):
+    """Tests for the stricter tie, text and whole-number rules (Nov 9 review)."""
+
+    def setUp(self):
+        """Creates the converter under test."""
+        self.converter = MySQLToPGQueryConverter()
+
+    @staticmethod
+    def _res(cols, rows):
+        """Builds a query result from column names and rows."""
+        return QueryResult(columns=cols, rows=rows, total_rows=len(rows), error=None)
+
+    def test_case_sensitive_collate_keys_are_not_case_insensitive_ties(self):
+        """Verify `ORDER BY name COLLATE utf8mb4_bin` keeps 'Apple' and 'apple' apart."""
+        q = "SELECT name, n FROM t ORDER BY name COLLATE utf8mb4_bin"
+        src = self._res(["name", "n"], [("Apple", 1), ("apple", 2)])
+        dest = self._res(["name", "n"], [("apple", 2), ("Apple", 1)])
+        self.assertFalse(self.converter.compare_results(src, dest, q)[0])
+        # The default (case-insensitive) collation still treats them as tied.
+        q_ci = "SELECT name, n FROM t ORDER BY name"
+        self.assertTrue(self.converter.compare_results(src, dest, q_ci)[0])
+
+    def test_trailing_space_is_not_a_tie(self):
+        """Verify 'a' and 'a ' are different sort keys."""
+        q = "SELECT name, n FROM t ORDER BY name"
+        src = self._res(["name", "n"], [("a", 1), ("a ", 2)])
+        dest = self._res(["name", "n"], [("a ", 2), ("a", 1)])
+        self.assertFalse(self.converter.compare_results(src, dest, q)[0])
+
+    def test_big_numeric_keys_are_not_merged_into_one_tie_group(self):
+        """Verify large decimals and integers that differ are separate groups."""
+        q = "SELECT name, total FROM t ORDER BY total"
+        src = self._res(["name", "total"], [("x", decimal.Decimal("98765432.10")), ("y", decimal.Decimal("98765432.11"))])
+        dest = self._res(["name", "total"], [("y", decimal.Decimal("98765432.11")), ("x", decimal.Decimal("98765432.10"))])
+        self.assertFalse(self.converter.compare_results(src, dest, q)[0])
+        q = "SELECT ts, who FROM t ORDER BY ts"
+        src = self._res(["ts", "who"], [(1700000000000, "a"), (1700000000000, "b"), (1700000001000, "c")])
+        dest = self._res(["ts", "who"], [(1700000000000, "b"), (1700000001000, "c"), (1700000000000, "a")])
+        self.assertFalse(self.converter.compare_results(src, dest, q)[0])
+        # Genuinely tied keys may still swap.
+        dest_ok = self._res(["ts", "who"], [(1700000000000, "b"), (1700000000000, "a"), (1700000001000, "c")])
+        self.assertTrue(self.converter.compare_results(src, dest_ok, q)[0])
+
+    def test_text_cells_are_never_compared_as_numbers(self):
+        """Verify '6.1' vs '6.14' and '1.10' vs '1.1' are mismatches."""
+        self.assertFalse(self.converter._values_equal("6.1", "6.14"))
+        self.assertFalse(self.converter._values_equal("1.10", "1.1"))
+        self.assertFalse(self.converter._values_equal("0.1234567891", "0.1234567892"))
+        # A MySQL decimal against a PostgreSQL float still uses the number rules.
+        self.assertTrue(self.converter._values_equal(decimal.Decimal("11.3333"), 11.333333333))
+
+    def test_whole_numbers_must_match_exactly(self):
+        """Verify money totals, IDs and whole floats are compared exactly."""
+        self.assertFalse(self.converter._values_equal(decimal.Decimal("98765432.10"), decimal.Decimal("98765432.11")))
+        self.assertFalse(self.converter._values_equal(1000000000, decimal.Decimal("1000000000.5")))
+        self.assertFalse(self.converter._values_equal(1234567.0, 1234568.0))
+        self.assertTrue(self.converter._values_equal(1234567.0, 1234567))
+        # A whole MySQL float against float noise on the PostgreSQL side is still fine.
+        self.assertTrue(self.converter._values_equal(10.0, 10.000000000000002))
+
+    def test_qualified_hidden_sort_key_does_not_match_a_same_named_column(self):
+        """Verify `ORDER BY o.order_date` is not mapped to `DATE(o.order_date) AS order_date`."""
+        q = "SELECT o.name, DATE(o.order_date) AS order_date FROM o ORDER BY o.order_date"
+        src = self._res(["name", "order_date"], [("a", "2024-01-01"), ("b", "2024-01-01"), ("c", "2024-01-01")])
+        dest = self._res(["name", "order_date"], [("c", "2024-01-01"), ("b", "2024-01-01"), ("a", "2024-01-01")])
+        self.assertFalse(self.converter.compare_results(src, dest, q)[0])
+        # With a `*` in the SELECT list the column can be an output column.
+        q_star = "SELECT o.* FROM o ORDER BY o.order_date"
+        src = self._res(["name", "order_date"], [("a", "2024-01-01"), ("b", "2024-01-01")])
+        dest = self._res(["name", "order_date"], [("b", "2024-01-01"), ("a", "2024-01-01")])
+        self.assertTrue(self.converter.compare_results(src, dest, q_star)[0])
+
+    def test_alias_wins_over_expression_when_mapping_sort_keys(self):
+        """Verify `SELECT a AS b, b AS a ... ORDER BY a` sorts by the second column."""
+        q = "SELECT a AS b, b AS a FROM t2 ORDER BY a"
+        src = self._res(["b", "a"], [(1, 10), (1, 20)])
+        dest = self._res(["b", "a"], [(1, 20), (1, 10)])
+        self.assertFalse(self.converter.compare_results(src, dest, q)[0])
+
+
+class TestTiebreakerRerunGuards(unittest.TestCase):
+    """Tests for the guards around the shared tie-breaker re-run."""
+
+    def test_window_function_name_ignores_parens_inside_strings(self):
+        """Verify a `(` inside a string literal does not change the function name."""
+        from db_convertor.query_conversion_orchestrator import _window_function_name
+        self.assertEqual(_window_function_name("SELECT name, SUM(CASE WHEN name = 'lag(' THEN 0 ELSE sal END) "), "sum")
+        self.assertEqual(_window_function_name("SELECT a, ROW_NUMBER() "), "row_number")
+
+    def test_dropped_sort_key_blocks_the_rerun(self):
+        """Verify a converted query with fewer sort keys is refused before any re-run."""
+        from db_convertor.query_conversion_orchestrator import _missing_sort_keys
+        src = "SELECT name, sal FROM emp ORDER BY sal DESC, name LIMIT 1"
+        self.assertTrue(_missing_sort_keys(src, 'SELECT name, sal FROM emp ORDER BY sal DESC LIMIT 1'))
+        self.assertEqual(_missing_sort_keys(src, 'SELECT name, sal FROM emp ORDER BY sal DESC NULLS LAST, name LIMIT 1'), "")
+        src_w = "SELECT d, ROW_NUMBER() OVER (PARTITION BY d ORDER BY s DESC, n) rn FROM t"
+        self.assertTrue(_missing_sort_keys(src_w, 'SELECT d, ROW_NUMBER() OVER (PARTITION BY d ORDER BY s DESC) rn FROM t'))
+        self.assertEqual(_missing_sort_keys(src_w, 'SELECT d, ROW_NUMBER() OVER (PARTITION BY d ORDER BY s DESC NULLS LAST, n) rn FROM t'), "")
+
+    def test_fetch_first_and_comma_joins_get_tiebreakers(self):
+        """Verify PostgreSQL `FETCH FIRST` counts as a top-N and `FROM a, b` yields both tables."""
+        ddl = "CREATE TABLE a (id INT, x INT); CREATE TABLE b (id INT, y INT);"
+        out = _inject_deterministic_tiebreakers("SELECT x FROM a ORDER BY x FETCH FIRST 3 ROWS ONLY", "postgresql", ddl)
+        self.assertIn('"a"."id" ASC NULLS FIRST', out)
+        out = _inject_deterministic_tiebreakers("SELECT a.x, b.y FROM a, b WHERE a.id = b.id ORDER BY a.x LIMIT 1", "mysql", ddl)
+        self.assertIn("`b`.`y`", out)

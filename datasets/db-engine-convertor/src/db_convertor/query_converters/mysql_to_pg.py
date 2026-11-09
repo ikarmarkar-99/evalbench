@@ -47,11 +47,14 @@ _ORDER_END_RE = re.compile(
     r"\b(limit|offset|fetch|for\s+update|for\s+share|lock\s+in)\b|;",
     re.IGNORECASE,
 )
-# Sort modifiers that can follow an ORDER BY key.
+# Sort modifiers that can follow an ORDER BY key. The COLLATE name is kept
+# (group 2) so the caller can tell a case-sensitive sort from the default.
 _ORDER_SUFFIX_RE = re.compile(
-    r"(\s+collate\s+\S+)?(\s+(asc|desc))?(\s+nulls\s+(first|last))?\s*$",
+    r"(\s+collate\s+(\S+))?(\s+(asc|desc))?(\s+nulls\s+(first|last))?\s*$",
     re.IGNORECASE,
 )
+# A key sorted byte by byte in MySQL (`BINARY col`, `CAST(col AS BINARY)`).
+_BINARY_KEY_RE = re.compile(r"^binary\b|\bas\s+binary\b", re.IGNORECASE)
 # A plain (optionally table-qualified) column reference such as `t`.`col`.
 _SIMPLE_REF_RE = re.compile(r"^[\w$]+(\.[\w$]+)*$")
 
@@ -135,19 +138,22 @@ def _split_top_level(text: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _top_level_order_keys(sql: str) -> Optional[List[str]]:
-    """Returns the sort keys of the query's outermost ORDER BY, or None.
+def _top_level_order_items(sql: str) -> Optional[List[Tuple[str, bool]]]:
+    """Returns `(key, case_insensitive)` for each key of the outermost ORDER BY.
 
     ORDER BY clauses inside parentheses (subqueries, CTEs, window functions)
     are ignored; only the one that sorts the final result counts. Each key is
     returned without its ASC/DESC, NULLS FIRST/LAST or COLLATE suffix.
+    `case_insensitive` is True for MySQL's default text comparison and False
+    when the key asks for a byte or case-sensitive sort (`COLLATE utf8mb4_bin`,
+    `COLLATE ..._cs`, `BINARY col`, `CAST(col AS BINARY)`).
 
     Args:
         sql: A SQL query.
 
     Returns:
-        The list of key expressions, or None if the final result is not
-        sorted.
+        The list of `(key expression, case_insensitive)`, or None if the final
+        result is not sorted.
     """
     masked = _mask_sql(sql, mask_parens=True)
     matches = list(re.finditer(r"\border\s+by\b", masked, re.IGNORECASE))
@@ -156,12 +162,26 @@ def _top_level_order_keys(sql: str) -> Optional[List[str]]:
     start = matches[-1].end()
     end_match = _ORDER_END_RE.search(masked, start)
     end = end_match.start() if end_match else len(sql)
-    keys = []
+    items = []
     for key in _split_top_level(sql[start:end]):
+        suffix = _ORDER_SUFFIX_RE.search(key)
+        collation = (suffix.group(2) or "").strip("`\"'").lower() if suffix else ""
         key = _ORDER_SUFFIX_RE.sub("", key).strip()
         if key:
-            keys.append(key)
-    return keys or None
+            case_insensitive = not _BINARY_KEY_RE.search(key) and (
+                not collation or collation.endswith("_ci")
+            )
+            items.append((key, case_insensitive))
+    return items or None
+
+
+def _top_level_order_keys(sql: str) -> Optional[List[str]]:
+    """Returns the sort keys of the query's outermost ORDER BY, or None.
+
+    Same as `_top_level_order_items` without the case-sensitivity flags.
+    """
+    items = _top_level_order_items(sql)
+    return [key for key, _ in items] if items else None
 
 
 def _normalize_expr(text: str) -> str:
@@ -533,15 +553,17 @@ Output your decision now:
             `(matches, explanation)`.
         """
         all_cols = list(range(len(source_result.columns)))
-        keys = _top_level_order_keys(source_query)
+        order_items = _top_level_order_items(source_query)
         # No ORDER BY: only the set of rows matters.
-        if keys is None:
+        if order_items is None:
             if self._rows_match_on_columns(
                 source_result.rows, dest_result.rows, all_cols
             ):
                 return True, "the source query has no ORDER BY, so row order is free"
             return False, "the rows differ, not just their order"
 
+        keys = [key for key, _ in order_items]
+        case_flags = [ci for _, ci in order_items]
         key_cols = self._order_key_columns(keys, source_query, source_result)
         if key_cols is None:
             return (
@@ -550,16 +572,16 @@ Output your decision now:
                 "columns, so the order cannot be checked",
             )
 
-        src_groups = self._tie_groups(source_result.rows, key_cols)
-        dest_groups = self._tie_groups(dest_result.rows, key_cols)
+        src_groups = self._tie_groups(source_result.rows, key_cols, case_flags)
+        dest_groups = self._tie_groups(dest_result.rows, key_cols, case_flags)
         if len(src_groups) != len(dest_groups):
             return False, "the rows are not in the same ORDER BY order"
         for (src_key, src_rows), (dest_key, dest_rows) in zip(
             src_groups, dest_groups
         ):
             same_key = all(
-                self._keys_tied(a, b, src_vs_dest=True)
-                for a, b in zip(src_key, dest_key)
+                self._keys_tied(a, b, src_vs_dest=True, case_insensitive=ci)
+                for a, b, ci in zip(src_key, dest_key, case_flags)
             )
             if (
                 not same_key
@@ -575,8 +597,12 @@ Output your decision now:
     ) -> Optional[List[int]]:
         """Maps each ORDER BY key to the output column it sorts by.
 
-        A key matches a column by position (`ORDER BY 2`), by output column
-        name or alias, or by being the same expression as a SELECT item.
+        A key matches a column by position (`ORDER BY 2`), by a SELECT alias
+        (MySQL resolves aliases first), by being the same expression as a
+        SELECT item, or by output column name. A table-qualified key such as
+        `o.order_date` only matches by name when the SELECT list has a `*`
+        (otherwise it could be a hidden column that merely shares a name with
+        a visible one).
 
         Args:
             keys: ORDER BY keys from `_top_level_order_keys`.
@@ -589,6 +615,7 @@ Output your decision now:
         """
         names = [_normalize_expr(str(c)) for c in source_result.columns]
         items = _select_items(source_query)
+        has_star = any(expr == "*" or expr.endswith(".*") for expr, _ in items)
         out = []
         for key in keys:
             norm = _normalize_expr(key)
@@ -596,38 +623,47 @@ Output your decision now:
             if re.fullmatch(r"\d+", norm):
                 n = int(norm) - 1
                 idx = n if 0 <= n < len(names) else None
+            # A SELECT alias (checked first, as MySQL does).
+            if idx is None:
+                for i, (_, alias) in enumerate(items):
+                    if alias is not None and alias == norm and i < len(names):
+                        idx = i
+                        break
             # Same expression as a SELECT item (e.g. `t.col` or `SUM(x)`).
             if idx is None:
                 for i, (expr, _) in enumerate(items):
                     if expr == norm and i < len(names):
                         idx = i
                         break
-            # Output column name or alias (for `t.col`, the name is `col`).
+            # Output column name (for `t.col`, the name is `col`, but only
+            # when a `*` in the SELECT list can have produced that column).
             if idx is None:
-                short = norm.split(".")[-1] if _SIMPLE_REF_RE.match(norm) else norm
-                for i, name in enumerate(names):
-                    if name in (norm, short):
-                        idx = i
-                        break
-            if idx is None:
-                for i, (_, alias) in enumerate(items):
-                    if alias is not None and alias == norm and i < len(names):
-                        idx = i
-                        break
+                qualified = _SIMPLE_REF_RE.match(norm) and "." in norm
+                if not qualified or has_star:
+                    short = norm.split(".")[-1] if _SIMPLE_REF_RE.match(norm) else norm
+                    for i, name in enumerate(names):
+                        if name in (norm, short):
+                            idx = i
+                            break
             if idx is None:
                 return None
             out.append(idx)
         return out
 
     def _tie_groups(
-        self, rows: Sequence[Tuple], key_cols: Sequence[int]
+        self,
+        rows: Sequence[Tuple],
+        key_cols: Sequence[int],
+        case_flags: Optional[Sequence[bool]] = None,
     ) -> List[Tuple[Tuple, List[Tuple]]]:
         """Cuts `rows` into consecutive groups that share the same key values."""
+        flags = list(case_flags) if case_flags else [True] * len(key_cols)
         groups: List[Tuple[Tuple, List[Tuple]]] = []
         for row in rows:
             key = tuple(row[c] for c in key_cols)
             if groups and all(
-                self._keys_tied(a, b) for a, b in zip(groups[-1][0], key)
+                self._keys_tied(a, b, case_insensitive=ci)
+                for a, b, ci in zip(groups[-1][0], key, flags)
             ):
                 groups[-1][1].append(row)
             else:
@@ -635,25 +671,38 @@ Output your decision now:
         return groups
 
     @classmethod
-    def _keys_tied(cls, val1: Any, val2: Any, src_vs_dest: bool = False) -> bool:
+    def _keys_tied(
+        cls,
+        val1: Any,
+        val2: Any,
+        src_vs_dest: bool = False,
+        case_insensitive: bool = True,
+    ) -> bool:
         """True if MySQL would treat two sort-key values as tied.
 
-        MySQL's default text comparison ignores letter case and trailing
-        spaces, so 'Apple' and 'apple ' are tied. Numbers within one result are
-        tied when they agree to one part in a billion; when comparing a MySQL
-        key (`val1`) with a PostgreSQL key (`val2`, `src_vs_dest=True`), the
-        rules of `_numbers_match` apply.
+        Within one result (`src_vs_dest=False`) two keys are tied only when
+        they are exactly equal: numbers by value (`1` and `1.0` tie,
+        `98765432.10` and `98765432.11` do not) and text byte for byte, except
+        that MySQL's default `_ci` collations ignore letter case, so text is
+        lower-cased first when `case_insensitive` is True. When comparing a
+        MySQL key (`val1`) with a PostgreSQL key (`val2`, `src_vs_dest=True`),
+        numbers follow the rules of `_numbers_match`.
         """
         if val1 is None or val2 is None:
             return val1 is None and val2 is None
-        num1, num2 = cls._as_number(val1), cls._as_number(val2)
-        if num1 is not None and num2 is not None:
-            if src_vs_dest:
-                return cls._numbers_match(num1, num2, val1, _ABS_TOL)
-            return math.isclose(
-                float(num1), float(num2), rel_tol=_REL_TOL, abs_tol=_ABS_TOL
-            )
-        return str(val1).rstrip().lower() == str(val2).rstrip().lower()
+        if not (isinstance(val1, str) and isinstance(val2, str)):
+            num1, num2 = cls._as_number(val1), cls._as_number(val2)
+            if num1 is not None and num2 is not None:
+                if src_vs_dest:
+                    return cls._numbers_match(num1, num2, val1, _ABS_TOL)
+                try:
+                    return decimal.Decimal(str(num1)) == decimal.Decimal(str(num2))
+                except decimal.InvalidOperation:
+                    return False
+        s1, s2 = str(val1), str(val2)
+        if case_insensitive:
+            s1, s2 = s1.lower(), s2.lower()
+        return s1 == s2
 
     @staticmethod
     def _as_number(val: Any) -> Optional[Any]:
@@ -675,11 +724,14 @@ Output your decision now:
 
     @staticmethod
     def _is_whole(num: Any) -> bool:
-        """True for whole-number values: ints and Decimals without decimals."""
+        """True for whole-number values: ints, Decimals without decimals, and
+        floats with no fractional part (`1234567.0`)."""
         if isinstance(num, int):
             return True
         if isinstance(num, decimal.Decimal) and num.is_finite():
             return num.as_tuple().exponent >= 0
+        if isinstance(num, float) and math.isfinite(num):
+            return num.is_integer()
         return False
 
     @staticmethod
@@ -703,7 +755,13 @@ Output your decision now:
         """Compares a MySQL number with a PostgreSQL number.
 
         Rules:
-          - Both whole numbers: must be exactly equal (compared as integers).
+          - Both whole numbers (including floats such as `1234567.0`): must be
+            exactly equal (compared as integers).
+          - A whole MySQL integer or decimal against a non-whole PostgreSQL
+            value never matches (`1000000000` vs `1000000000.5`). A whole
+            MySQL *float* against a non-whole value falls through to the
+            tolerance below, since float math can land on a whole number by
+            chance on one side only.
           - Otherwise they match if they agree to one part in a billion
             (`_REL_TOL`, with `epsilon` as the absolute floor near zero), or
             to one part in a million (`_MYSQL_FLOAT_REL_TOL`) when MySQL
@@ -725,8 +783,19 @@ Output your decision now:
         Returns:
             True if the two numbers match.
         """
-        if cls._is_whole(src_num) and cls._is_whole(dest_num):
+        src_whole, dest_whole = cls._is_whole(src_num), cls._is_whole(dest_num)
+        if src_whole and dest_whole:
             return int(src_num) == int(dest_num)
+        if src_whole and not isinstance(src_num, float):
+            return False
+        both_exact = not isinstance(src_num, float) and not isinstance(
+            dest_num, float
+        )
+        if both_exact:
+            # Two exact decimals (MySQL DECIMAL vs PostgreSQL numeric) never
+            # get a tolerance: the only allowed difference is PostgreSQL
+            # carrying more decimal places than MySQL printed.
+            return cls._rounds_to(src_num, dest_num, src_raw)
         f1, f2 = float(src_num), float(dest_num)
         if math.isnan(f1) or math.isnan(f2):
             return math.isnan(f1) and math.isnan(f2)
@@ -737,6 +806,26 @@ Output your decision now:
         )
         if math.isclose(f1, f2, rel_tol=rel, abs_tol=epsilon):
             return True
+        return cls._rounds_to(src_num, dest_num, src_raw)
+
+    @classmethod
+    def _rounds_to(cls, src_num: Any, dest_num: Any, src_raw: Any) -> bool:
+        """True if the PostgreSQL value rounds to the MySQL value's decimals.
+
+        MySQL prints `AVG` and `/` results to 4 decimal places (e.g.
+        `11.3333`); PostgreSQL keeps more (`11.333333...`). The two match when
+        the PostgreSQL value, rounded half away from zero to the number of
+        decimals MySQL printed, equals the MySQL value. A whole MySQL number
+        (no decimals) never matches this way.
+
+        Args:
+            src_num: MySQL value as a number.
+            dest_num: PostgreSQL value as a number.
+            src_raw: The original MySQL value (to count its decimal places).
+
+        Returns:
+            True if the rounded PostgreSQL value equals the MySQL value.
+        """
         places = cls._decimal_places(src_raw)
         if places == 0:
             return False
@@ -760,11 +849,13 @@ Output your decision now:
 
         Rules:
           - Two NULLs match; a NULL and a value do not.
+          - Two text values must match exactly, even when they look like
+            numbers (`'6.1'` is not `'6.14'`).
           - Numbers follow `_numbers_match`: whole numbers (counts, sums of
             integers, IDs) exactly; others to one part in a billion (one part
             in a million for MySQL floating-point values), or equal after
             rounding the PostgreSQL value the way MySQL rounded its own.
-          - Text must match exactly, including letter case and spaces.
+          - Everything else must print identically.
 
         Args:
             val1: Cell value from the MySQL result (order matters: only the
@@ -779,6 +870,8 @@ Output your decision now:
             return val1 is None and val2 is None
         if val1 == val2 and type(val1) is type(val2):
             return True
+        if isinstance(val1, str) and isinstance(val2, str):
+            return False
 
         num1, num2 = self._as_number(val1), self._as_number(val2)
         if num1 is not None and num2 is not None:
