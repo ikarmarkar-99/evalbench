@@ -979,3 +979,56 @@ class TestSameResultTieRule(unittest.TestCase):
         self.assertFalse(same(decimal.Decimal("0.49826989619377162630"), decimal.Decimal("0")))
         self.assertFalse(same(1700000000000, 1700000001000))
         self.assertTrue(same(1, decimal.Decimal("1.0")))
+
+
+class TestCandidateVeto(unittest.TestCase):
+    """Tests for the refusal of ctid sorting and hard-coded data values."""
+
+    def setUp(self):
+        """Creates the converter under test."""
+        self.reject = MySQLToPGQueryConverter.reject_candidate
+        self.src = "SELECT title, n FROM t WHERE kind = 'Lecture' AND d LIKE '2019%' ORDER BY n DESC LIMIT 3"
+
+    def test_ctid_is_refused(self):
+        """Verify sorting by ctid is rejected even when it is the only trick."""
+        self.assertIn("ctid", self.reject(self.src, 'SELECT "title", n FROM t ORDER BY n DESC, ctid LIMIT 3'))
+        # A literal containing the word ctid is not the column.
+        self.assertEqual(self.reject(self.src, "SELECT title, n FROM t WHERE kind = 'Lecture' ORDER BY n DESC LIMIT 3"), "")
+
+    def test_copied_data_values_are_refused(self):
+        """Verify a CASE that names data values not present in the MySQL query is rejected."""
+        bad = ("SELECT title, n FROM t WHERE kind = 'Lecture' ORDER BY n DESC, "
+               "CASE WHEN title = 'Statistical Thermodynamics' THEN 0 ELSE 1 END LIMIT 3")
+        self.assertIn("statistical thermodynamics", self.reject(self.src, bad))
+
+    def test_harmless_literals_are_allowed(self):
+        """Verify format strings, regexes, units, collations and literals from the MySQL query pass."""
+        ok = ("SELECT TO_CHAR(d, 'YYYY-MM-DD'), TO_CHAR(n, 'FM999,990.00'), SPLIT_PART(title, ' ', 1), "
+              "REGEXP_REPLACE(title, '[^0-9]', ''), d + INTERVAL '1 day', EXTRACT(EPOCH FROM d), "
+              "COALESCE(kind, 'Lecture') FROM t WHERE d::text LIKE '2019%' AND title ~ '^\\d+' "
+              "ORDER BY title COLLATE \"und-x-icu\" ASC NULLS FIRST, CASE WHEN GROUPING(title) = 1 THEN 'zzz' ELSE title END LIMIT 3")
+        self.assertEqual(self.reject(self.src, ok), "")
+        # A number MySQL wrote bare and PostgreSQL quotes is fine.
+        self.assertEqual(self.reject("SELECT a FROM t WHERE year = 2022", "SELECT a FROM t WHERE year = '2022'"), "")
+
+    def test_orchestrator_veto_blocks_mechanical_match_and_rerun(self):
+        """Verify a vetoed candidate never matches, even with identical results."""
+        orch = QueryConversionOrchestrator(
+            converter=MySQLToPGQueryConverter(), source_connection={}, dest_connection={},
+            source_schema="", dest_schema="", max_attempts=1)
+        res = QueryResult(columns=["a"], rows=[(1,)], total_rows=1, error=None)
+        ok, why = orch._compare(res, res, "SELECT a FROM t ORDER BY a", "SELECT a FROM t ORDER BY a, ctid")
+        self.assertFalse(ok); self.assertIn("ctid", why)
+        ok, why = orch._check_shared_window_tiebreaker("SELECT a FROM t ORDER BY a LIMIT 1", "SELECT a FROM t ORDER BY a, ctid LIMIT 1")
+        self.assertFalse(ok); self.assertIn("ctid", why)
+        # Existing converters have no veto and are unaffected.
+        plain = QueryConversionOrchestrator(
+            converter=SQLiteToPGQueryConverter(), source_connection={}, dest_connection={},
+            source_schema="", dest_schema="", max_attempts=1)
+        self.assertEqual(plain._veto("SELECT a FROM t", "SELECT a FROM t ORDER BY ctid"), "")
+
+    def test_prompt_tells_the_model_about_the_veto(self):
+        """Verify the next prompt names the rejected trick."""
+        prompt = MySQLToPGQueryConverter().get_conversion_prompt(
+            "s", "d", self.src, converted_query="SELECT title, n FROM t ORDER BY n DESC, ctid LIMIT 3")
+        self.assertIn("REJECTED", prompt); self.assertIn("ctid", prompt)

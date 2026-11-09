@@ -1147,6 +1147,15 @@ class QueryConversionOrchestrator:
                     # If result_matched but no converted_query provided, use source query
                     # (LLM is saying the query doesn't need conversion)
                     final_query = converted_query if converted_query else source_query
+
+                    # Converters that can spot disallowed tricks (e.g. sorting
+                    # by ctid or hard-coding data values) veto the candidate
+                    # even when the AI declares a match.
+                    veto = self._veto(source_query, final_query)
+                    if status == ConversionStatus.RESULT_MATCHED and veto:
+                        safe_print(f"✗ Candidate rejected: {veto}")
+                        last_notes = f"Rejected: {veto}"
+                        continue
                     
                     # Return the final result
                     return ConversionResult(
@@ -1181,7 +1190,7 @@ class QueryConversionOrchestrator:
                             self.converter, 'allow_tie_equivalence', False
                         )
                         matches, match_reason = self._compare(
-                            source_result, dest_result, source_query
+                            source_result, dest_result, source_query, converted_query
                         )
                         if (
                             not matches
@@ -1398,6 +1407,9 @@ class QueryConversionOrchestrator:
             Tuple of `(matches, reason)` after running both queries with shared tie-breakers.
         """
         schema_ddl = self.dest_schema or self.source_schema or ""
+        veto = self._veto(source_query, converted_query)
+        if veto:
+            return False, f"Candidate rejected: it {veto}"
         # The appended tie-breakers must never stand in for a sort key the
         # converted query forgot: its top-level ORDER BY (and each of its
         # window ORDER BYs, in order) must have at least as many keys as the
@@ -1437,18 +1449,36 @@ class QueryConversionOrchestrator:
             )
         return False, reason
     
+    def _veto(self, source_query: str, converted_query: str) -> str:
+        """Asks the converter whether a candidate query is disallowed.
+
+        Only converters that define `reject_candidate` (such as
+        `MySQLToPGQueryConverter`, which refuses `ctid` sorting and hard-coded
+        data values) can veto; for every other converter this returns "".
+        """
+        reject = getattr(self.converter, "reject_candidate", None)
+        if not reject:
+            return ""
+        schema = (self.source_schema or "") + "\n" + (self.dest_schema or "")
+        return reject(source_query, converted_query, schema)
+
     def _compare(
         self,
         source_result: QueryResult,
         dest_result: QueryResult,
         source_query: str,
+        converted_query: str = "",
     ) -> Tuple[bool, str]:
         """Calls the converter's `compare_results`, passing `source_query` if it takes one.
 
         Converters that can check row order against the source query's ORDER BY
         (such as `MySQLToPGQueryConverter`) accept a `source_query` argument;
-        all existing converters are called exactly as before.
+        all existing converters are called exactly as before. A candidate the
+        converter vetoes (see `_veto`) never matches, whatever its results.
         """
+        veto = self._veto(source_query, converted_query)
+        if veto:
+            return False, f"Candidate rejected: it {veto}"
         params = inspect.signature(self.converter.compare_results).parameters
         if "source_query" in params:
             return self.converter.compare_results(

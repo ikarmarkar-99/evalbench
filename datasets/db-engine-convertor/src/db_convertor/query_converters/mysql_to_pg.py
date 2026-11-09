@@ -57,6 +57,23 @@ _ORDER_SUFFIX_RE = re.compile(
 _BINARY_KEY_RE = re.compile(r"^binary\b|\bas\s+binary\b", re.IGNORECASE)
 # A plain (optionally table-qualified) column reference such as `t`.`col`.
 _SIMPLE_REF_RE = re.compile(r"^[\w$]+(\.[\w$]+)*$")
+# Pieces of a date/number format string (`'YYYY-MM-DD'`, `'FM999,990.00'`,
+# `'HH24:MI'`, `'Dy'`); a literal made only of these is not data.
+_FORMAT_TOKEN_RE = re.compile(
+    r"(?:yyyy|iyyy|yy|mm|dd|hh24|hh12|hh|mi|ss|ms|us|fm|am|pm|a\.m\.|p\.m\.|"
+    r"dy|day|mon|month|tz|iw|q|j|w|d|th|0|9|[\s,.:/\-_T\"'()+%])",
+    re.IGNORECASE,
+)
+# Literals the model may add without copying data: interval units, sort
+# sentinels for ROLLUP labels, collation names, booleans and special floats.
+_HARMLESS_LITERALS = frozenset({
+    "second", "seconds", "minute", "minutes", "hour", "hours", "day", "days",
+    "week", "weeks", "month", "months", "quarter", "quarters", "year", "years",
+    "epoch", "dow", "doy", "isodow", "century", "decade", "millisecond",
+    "microsecond", "zzz", "total", "subtotal", "grand total", "und-x-icu",
+    "c", "posix", "default", "utc", "true", "false", "t", "f", "nan",
+    "infinity", "-infinity", "escape", "both", "leading", "trailing",
+})
 
 
 def _mask_sql(sql: str, mask_parens: bool) -> str:
@@ -247,6 +264,71 @@ class MySQLToPGQueryConverter(QueryConverter):
         super().__init__("mysql", "postgresql")
         self.allow_tie_equivalence = allow_tie_equivalence
 
+    @staticmethod
+    def reject_candidate(
+        source_query: str, converted_query: str, schema: str = ""
+    ) -> str:
+        """Returns why a candidate query is disallowed, or "" if it is fine.
+
+        Two tricks can make a PostgreSQL query reproduce MySQL's accidental
+        order of tied rows without being a real translation, so they are
+        refused outright:
+          1. Sorting by `ctid` (the physical row position).
+          2. Copying data values into the query (`CASE WHEN title =
+             'Statistical Thermodynamics' THEN 1 ...`): any quoted text in the
+             candidate that does not appear in the MySQL query. Format
+             strings (`'YYYY-MM-DD'`, `'FM999.00'`), regexes, numbers,
+             interval units, collation names, ROLLUP label sentinels, one- or
+             two-character literals, and values that appear in the table
+             definitions (such as ENUM members) are allowed.
+
+        Example:
+            `reject_candidate("SELECT a FROM t ORDER BY a", "SELECT a FROM t ORDER BY a, ctid")`
+            -> `"uses ctid (physical row order) to copy MySQL's tie order"`
+
+        Args:
+            source_query: The MySQL query.
+            converted_query: The candidate PostgreSQL query.
+            schema: Optional table definitions; quoted values found there
+                (ENUM members, defaults) are not treated as copied data.
+
+        Returns:
+            A short reason, or an empty string.
+        """
+        if not converted_query:
+            return ""
+        schema_lower = (schema or "").lower()
+        masked = _mask_sql(converted_query, mask_parens=False)
+        if re.search(r"\bctid\b", masked, re.IGNORECASE):
+            return "uses ctid (physical row order) to copy MySQL's tie order"
+        src_lower = source_query.lower()
+        src_literals = {s.lower() for s in re.findall(r"'((?:[^']|'')*)'", source_query)}
+        bad = []
+        for lit in re.findall(r"'((?:[^']|'')*)'", converted_query):
+            low = lit.replace("''", "'").strip().lower()
+            if (
+                len(low) <= 2
+                or low in src_literals
+                or low in _HARMLESS_LITERALS
+                or low.startswith(("^", "[", "%", "\\", "(?"))
+                or re.search(r"\\[dswb]", low)
+                or not _FORMAT_TOKEN_RE.sub("", low)
+                or re.fullmatch(r"-?\d+(\.\d+)?(e[-+]?\d+)?", low)
+                or re.fullmatch(r"\d+\s+[a-z]+", low)
+                or re.search(r"(?<![\w])" + re.escape(low) + r"(?![\w])", src_lower)
+                or (schema_lower and f"'{low}'" in schema_lower)
+            ):
+                continue
+            if low not in bad:
+                bad.append(low)
+        if bad:
+            shown = ", ".join(f"'{b}'" for b in bad[:3])
+            return (
+                f"hard-codes data value(s) {shown} that are not in the MySQL "
+                "query (copying MySQL's tie order is not a conversion)"
+            )
+        return ""
+
     def get_conversion_prompt(
         self,
         source_schema: str,
@@ -354,6 +436,16 @@ DESTINATION (PostgreSQL):
             prompt += f"""
 ===== CURRENT CONVERSION ATTEMPT =====
 {converted_query}
+"""
+            veto = self.reject_candidate(
+                source_query, converted_query, source_schema + "\n" + dest_schema
+            )
+            if veto:
+                prompt += f"""
+===== REJECTED =====
+✗ This attempt is REJECTED regardless of its results: it {veto}.
+Such a query can never be accepted. Write a plain translation of the MySQL query instead; if the
+MySQL result depends on how tied rows happen to be ordered, declare "unable_to_match".
 """
 
             if dest_result:
