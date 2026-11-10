@@ -1032,3 +1032,38 @@ class TestCandidateVeto(unittest.TestCase):
         prompt = MySQLToPGQueryConverter().get_conversion_prompt(
             "s", "d", self.src, converted_query="SELECT title, n FROM t ORDER BY n DESC, ctid LIMIT 3")
         self.assertIn("REJECTED", prompt); self.assertIn("ctid", prompt)
+
+
+    def test_float_noise_cluster_on_primary_key_stays_one_tie_group(self):
+        """Verify 1-ULP float differences on key 1 do not split on key 2."""
+        c = MySQLToPGQueryConverter()
+        q = "SELECT id, cov FROM t ORDER BY cov DESC, id ASC"
+        # Both rows represent sqrt(2); 1-ULP float difference swaps which row
+        # gets .0951 vs .0950 between MySQL and PostgreSQL.
+        src = QueryResult(
+            columns=["id", "cov"],
+            rows=[("a", 1.4142135623730951), ("b", 1.4142135623730950)],
+            total_rows=2,
+            error=None,
+        )
+        dest = QueryResult(
+            columns=["id", "cov"],
+            rows=[("b", 1.4142135623730951), ("a", 1.4142135623730950)],
+            total_rows=2,
+            error=None,
+        )
+        self.assertTrue(c.compare_results(src, dest, q)[0])
+        # When key 1 is bit-identical (e.g. 0.0 == 0.0), key 2 is still enforced.
+        src_exact = QueryResult(
+            columns=["id", "cov"],
+            rows=[("a", 0.0), ("b", 0.0)],
+            total_rows=2,
+            error=None,
+        )
+        dest_reversed = QueryResult(
+            columns=["id", "cov"],
+            rows=[("b", 0.0), ("a", 0.0)],
+            total_rows=2,
+            error=None,
+        )
+        self.assertFalse(c.compare_results(src_exact, dest_reversed, q)[0])

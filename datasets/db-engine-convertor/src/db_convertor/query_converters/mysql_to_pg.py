@@ -664,8 +664,12 @@ Output your decision now:
                 "columns, so the order cannot be checked",
             )
 
-        src_groups = self._tie_groups(source_result.rows, key_cols, case_flags)
-        dest_groups = self._tie_groups(dest_result.rows, key_cols, case_flags)
+        src_groups = self._tie_groups(
+            source_result.rows, key_cols, case_flags, dest_result.rows
+        )
+        dest_groups = self._tie_groups(
+            dest_result.rows, key_cols, case_flags, source_result.rows
+        )
         if len(src_groups) != len(dest_groups):
             return False, "the rows are not in the same ORDER BY order"
         for (src_key, src_rows), (dest_key, dest_rows) in zip(
@@ -747,10 +751,78 @@ Output your decision now:
         rows: Sequence[Tuple],
         key_cols: Sequence[int],
         case_flags: Optional[Sequence[bool]] = None,
+        other_rows: Optional[Sequence[Tuple]] = None,
     ) -> List[Tuple[Tuple, List[Tuple]]]:
-        """Cuts `rows` into consecutive groups that share the same key values."""
+        """Cuts `rows` into consecutive groups that share the same key values.
+
+        If a cluster of consecutive rows ties on an earlier numeric sort key
+        only within floating-point tolerance (meaning the cluster contains two
+        different 64-bit floats such as `1.4142135623730951` and
+        `1.4142135623730950`), the database sorted those rows by that 16th-digit
+        float difference and never reached later sort keys across the boundary,
+        so that cluster is kept as one tie group (with later keys masked to
+        `None`). When the earlier key is identical across the cluster (e.g.
+        `100 == 100` or `0.0 == 0.0`), later sort keys still split the cluster.
+        """
         flags = list(case_flags) if case_flags else [True] * len(key_cols)
-        groups: List[Tuple[Tuple, List[Tuple]]] = []
+        if not rows:
+            return []
+        # Check if any earlier key column has multi-ULP float-noise clusters.
+        if len(key_cols) > 1:
+            first_col = key_cols[0]
+            first_ci = flags[0]
+            clusters: List[List[Tuple]] = []
+            for row in rows:
+                if clusters and self._keys_tied(
+                    clusters[-1][0][first_col],
+                    row[first_col],
+                    case_insensitive=first_ci,
+                ):
+                    clusters[-1].append(row)
+                else:
+                    clusters.append([row])
+            other_clusters: List[List[Tuple]] = []
+            if other_rows and len(other_rows) == len(rows):
+                for row in other_rows:
+                    if other_clusters and self._keys_tied(
+                        other_clusters[-1][0][first_col],
+                        row[first_col],
+                        case_insensitive=first_ci,
+                    ):
+                        other_clusters[-1].append(row)
+                    else:
+                        other_clusters.append([row])
+            groups: List[Tuple[Tuple, List[Tuple]]] = []
+            for idx, cluster in enumerate(clusters):
+                distinct_vals = {
+                    r[first_col]
+                    for r in cluster
+                    if isinstance(r[first_col], (float, decimal.Decimal))
+                    and not self._is_whole(r[first_col])
+                }
+                if len(other_clusters) == len(clusters):
+                    distinct_vals |= {
+                        r[first_col]
+                        for r in other_clusters[idx]
+                        if isinstance(r[first_col], (float, decimal.Decimal))
+                        and not self._is_whole(r[first_col])
+                    }
+                if len(distinct_vals) > 1:
+                    key = (cluster[0][first_col],) + (None,) * (len(key_cols) - 1)
+                    groups.append((key, list(cluster)))
+                    continue
+                for row in cluster:
+                    key = tuple(row[c] for c in key_cols)
+                    if groups and all(
+                        self._keys_tied(a, b, case_insensitive=ci)
+                        for a, b, ci in zip(groups[-1][0], key, flags)
+                    ):
+                        groups[-1][1].append(row)
+                    else:
+                        groups.append((key, [row]))
+            return groups
+
+        groups = []
         for row in rows:
             key = tuple(row[c] for c in key_cols)
             if groups and all(
@@ -1062,10 +1134,11 @@ Output your decision now:
         if not cols or len(src_rows) != len(dest_rows):
             return False
 
-        # Try rounding sort keys to 4, 3, and 2 decimal places when sorting so
-        # two numbers like 1.23454 and 1.23456 don't accidentally sort in opposite
-        # orders, then verify every cell pair using `_values_equal` (1e-4).
-        for digits in (4, 3, 2):
+        # Try rounding sort keys to 8, 6, 4, 3, and 2 decimal places when sorting
+        # so small numbers like 0.018766 and 0.019169 sort apart while numbers
+        # differing only in the last digit still line up, then verify every cell
+        # pair using `_values_equal`.
+        for digits in (8, 6, 4, 3, 2):
             src_sorted = [
                 tuple(r[c] for c in cols)
                 for _, r in sorted(

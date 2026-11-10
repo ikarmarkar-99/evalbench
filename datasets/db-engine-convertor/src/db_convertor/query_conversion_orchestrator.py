@@ -588,6 +588,7 @@ def _inject_tiebreakers_in_select(
     schema_tables: Dict[str, List[Tuple[str, bool]]],
     pure_text_cols: Set[str],
     cte_tables: Optional[Dict[str, List[Tuple[str, bool]]]] = None,
+    query_has_user_var: bool = False,
 ) -> str:
     """Add shared tie-breaker columns to `OVER (... ORDER BY ...)` and `ORDER BY ... LIMIT` in one `SELECT` block.
 
@@ -659,13 +660,17 @@ def _inject_tiebreakers_in_select(
     )
     for tm in t_pat.finditer(from_body_masked):
         raw_t = tm.group(1).strip('`"').lower()
-        raw_a = (
-            tm.group(2).strip('`"')
-            if tm.group(2)
-            else tm.group(1).strip('`"')
-        )
+        raw_a_tok = tm.group(2) if tm.group(2) else tm.group(1)
+        raw_a = raw_a_tok.strip('`"')
         if raw_a.upper() in _SQL_KEYWORDS:
-            raw_a = tm.group(1).strip('`"')
+            raw_a_tok = tm.group(1)
+            raw_a = raw_a_tok.strip('`"')
+        # In PostgreSQL, unquoted identifiers fold to lowercase, so `"EngineeringDegreeCourses"`
+        # only keeps uppercase letters if the query itself wrote it in double quotes.
+        if dialect == "postgresql" and not raw_a_tok.startswith('"'):
+            qual_a = f"{q}{raw_a.lower()}{q}"
+        else:
+            qual_a = f"{q}{raw_a}{q}"
         if raw_t in schema_tables:
             alias_to_table[raw_a.lower()] = raw_t
             # When the query does not group or deduplicate rows (`GROUP BY` / `DISTINCT`),
@@ -685,7 +690,7 @@ def _inject_tiebreakers_in_select(
                 else:
                     chosen_cols = all_t_cols
                 for cname, is_t in chosen_cols:
-                    table_key_exprs.append((f"{q}{raw_a}{q}.{q}{cname}{q}", is_t))
+                    table_key_exprs.append((f"{qual_a}.{q}{cname}{q}", is_t))
         elif (
             raw_t in cte_tables
             and not has_group_by
@@ -696,7 +701,7 @@ def _inject_tiebreakers_in_select(
                 if has_bare_star:
                     table_key_exprs.append((f"{q}{cname}{q}", is_t))
                 else:
-                    table_key_exprs.append((f"{q}{raw_a}{q}.{q}{cname}{q}", is_t))
+                    table_key_exprs.append((f"{qual_a}.{q}{cname}{q}", is_t))
 
     # If the query uses `GROUP BY ROLLUP(...)` together with a window function,
     # include the `GROUP BY` columns as tie-breakers so summary (`NULL`) rows sort consistently.
@@ -810,11 +815,15 @@ def _inject_tiebreakers_in_select(
     has_limit = bool(
         re.search(r"\b(?:LIMIT|FETCH)\b", tail_masked, flags=re.IGNORECASE)
     )
-    has_user_var = ":=" in select_body
-    # Only a top-N (`ORDER BY ... LIMIT`) or a MySQL `@rank :=` ranking needs
-    # tie-breakers here: without LIMIT, Check 2 already accepts tied rows in
-    # either order, so the query is left alone.
-    if ob_tail_m and (has_limit or has_user_var):
+    is_user_var_subquery = bool(
+        query_has_user_var and has_bare_star and not has_limit
+    )
+    has_user_var = (":=" in select_body) or is_user_var_subquery
+    has_rewritten_window = new_select_body != select_body
+    # A top-N (`ORDER BY ... LIMIT`), a MySQL `@rank :=` ranking, or a block
+    # whose window function was tie-broken (e.g. `LAG` masking repeated values)
+    # also gets tie-breakers on its trailing `ORDER BY`.
+    if ob_tail_m and (has_limit or has_user_var or has_rewritten_window):
         # Keep every one of the query's own sort keys exactly as written.
         raw_ob_body = tail_segment[ob_tail_m.start(1) : ob_tail_m.end(1)].strip()
         primary_formatted = [raw_ob_body]
@@ -824,6 +833,13 @@ def _inject_tiebreakers_in_select(
                 _format_tie_expr(e, dialect, is_t, "ASC")
                 for e, is_t in non_window_exprs
             ]
+            if has_rewritten_window:
+                for idx, item in enumerate(items, 1):
+                    if "OVER" in item.upper():
+                        if dialect == "postgresql":
+                            tail_ties.append(f"{idx} ASC NULLS FIRST")
+                        else:
+                            tail_ties.append(f"{idx} ASC")
         elif re.search(r"\bROLLUP\b", after_from_masked, flags=re.IGNORECASE):
             for idx in range(1, len(items) + 1):
                 if dialect == "mysql":
@@ -855,6 +871,8 @@ def _inject_tiebreakers_in_select(
             )
         all_ob = primary_formatted + tail_ties
         new_ob_clause = "ORDER BY " + ", ".join(all_ob)
+        if dialect == "mysql" and is_user_var_subquery:
+            new_ob_clause += " LIMIT 18446744073709551615"
         tail_segment = (
             tail_segment[: ob_tail_m.start()]
             + new_ob_clause
@@ -975,6 +993,7 @@ def _inject_deterministic_tiebreakers(
     clean_sql = _trim_sql(sql)
     schema_tables, pure_text_cols = _parse_schema_columns(schema_ddl)
     cte_tables = _extract_cte_columns(clean_sql, pure_text_cols)
+    query_has_user_var = ":=" in clean_sql
 
     def process_rec(text: str) -> str:
         """Walk through parenthesized subqueries from inside out, rewriting each `SELECT` block."""
@@ -1018,11 +1037,17 @@ def _inject_deterministic_tiebreakers(
                     schema_tables,
                     pure_text_cols,
                     cte_tables,
+                    query_has_user_var,
                 )
             return combined
         if re.match(r"^\s*SELECT\b", masked, flags=re.IGNORECASE):
             return _inject_tiebreakers_in_select(
-                combined, dialect, schema_tables, pure_text_cols, cte_tables
+                combined,
+                dialect,
+                schema_tables,
+                pure_text_cols,
+                cte_tables,
+                query_has_user_var,
             )
         return combined
 
