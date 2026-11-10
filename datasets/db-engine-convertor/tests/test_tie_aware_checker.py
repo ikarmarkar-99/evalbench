@@ -1067,3 +1067,36 @@ class TestCandidateVeto(unittest.TestCase):
             error=None,
         )
         self.assertFalse(c.compare_results(src_exact, dest_reversed, q)[0])
+
+    def test_second_sort_key_is_checked_when_databases_print_key_one_differently(self):
+        """Verify MySQL `11.3333` vs PostgreSQL `11.3333333333333333` is not rounding error."""
+        c = MySQLToPGQueryConverter()
+        q = "SELECT name, AVG(x) AS a FROM t GROUP BY name ORDER BY a DESC, name"
+        src = QueryResult(
+            columns=["name", "a"],
+            rows=[("amy", decimal.Decimal("11.3333")), ("bob", decimal.Decimal("11.3333")), ("cat", decimal.Decimal("11.3333"))],
+            total_rows=3,
+            error=None,
+        )
+        long_avg = decimal.Decimal("11.3333333333333333")
+        # Names in the right order: accepted.
+        same_order = QueryResult(
+            columns=["name", "a"],
+            rows=[("amy", long_avg), ("bob", long_avg), ("cat", long_avg)],
+            total_rows=3,
+            error=None,
+        )
+        self.assertTrue(c.compare_results(src, same_order, q)[0])
+        # Names backwards: the three rows are exactly tied on the average in
+        # each result, so the second sort key must still be enforced.
+        backwards = QueryResult(
+            columns=["name", "a"],
+            rows=[("cat", long_avg), ("bob", long_avg), ("amy", long_avg)],
+            total_rows=3,
+            error=None,
+        )
+        self.assertFalse(c.compare_results(src, backwards, q)[0])
+        # Same when MySQL returns a float and PostgreSQL an exact decimal.
+        src_f = QueryResult(columns=["name", "a"], rows=[("amy", 0.1), ("bob", 0.1)], total_rows=2, error=None)
+        dest_d = QueryResult(columns=["name", "a"], rows=[("bob", decimal.Decimal("0.1")), ("amy", decimal.Decimal("0.1"))], total_rows=2, error=None)
+        self.assertFalse(c.compare_results(src_f, dest_d, q)[0])

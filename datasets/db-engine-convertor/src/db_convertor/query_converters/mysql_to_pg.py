@@ -755,84 +755,100 @@ Output your decision now:
     ) -> List[Tuple[Tuple, List[Tuple]]]:
         """Cuts `rows` into consecutive groups that share the same key values.
 
-        If a cluster of consecutive rows ties on an earlier numeric sort key
-        only within floating-point tolerance (meaning the cluster contains two
-        different 64-bit floats such as `1.4142135623730951` and
-        `1.4142135623730950`), the database sorted those rows by that 16th-digit
-        float difference and never reached later sort keys across the boundary,
-        so that cluster is kept as one tie group (with later keys masked to
-        `None`). When the earlier key is identical across the cluster (e.g.
-        `100 == 100` or `0.0 == 0.0`), later sort keys still split the cluster.
+        Rounding error in the first sort key: a computed key (such as a
+        standard deviation) can come out as `1.4142135623730951` for one row
+        and `1.4142135623730950` for the next, even though the true values are
+        equal. The database then orders those rows by that last-digit
+        difference and never looks at the later sort keys, and the other
+        database may round the other way. So when a run of rows agrees on the
+        first key to one part in a billion but ONE result holds two different
+        values there, the run is kept as one tie group (later keys are not
+        used to split it).
+
+        The two results are never compared with each other for this: MySQL
+        printing `11.3333` where PostgreSQL prints `11.3333333333333333` is
+        not rounding error inside a result, so rows that are exactly tied on
+        the first key in both results are still split by the later keys.
+
+        Args:
+            rows: Rows of one result, in returned order.
+            key_cols: Output column index of each ORDER BY key.
+            case_flags: Per key, whether text compares case-insensitively.
+            other_rows: Rows of the other result, so both results are cut the
+                same way when only one of them has the rounding error.
+
+        Returns:
+            A list of `(key values, rows)` groups in order.
         """
         flags = list(case_flags) if case_flags else [True] * len(key_cols)
         if not rows:
             return []
-        # Check if any earlier key column has multi-ULP float-noise clusters.
-        if len(key_cols) > 1:
-            first_col = key_cols[0]
-            first_ci = flags[0]
-            clusters: List[List[Tuple]] = []
-            for row in rows:
-                if clusters and self._keys_tied(
-                    clusters[-1][0][first_col],
-                    row[first_col],
-                    case_insensitive=first_ci,
-                ):
-                    clusters[-1].append(row)
-                else:
-                    clusters.append([row])
-            other_clusters: List[List[Tuple]] = []
-            if other_rows and len(other_rows) == len(rows):
-                for row in other_rows:
-                    if other_clusters and self._keys_tied(
-                        other_clusters[-1][0][first_col],
-                        row[first_col],
-                        case_insensitive=first_ci,
-                    ):
-                        other_clusters[-1].append(row)
-                    else:
-                        other_clusters.append([row])
-            groups: List[Tuple[Tuple, List[Tuple]]] = []
-            for idx, cluster in enumerate(clusters):
-                distinct_vals = {
-                    r[first_col]
-                    for r in cluster
-                    if isinstance(r[first_col], (float, decimal.Decimal))
-                    and not self._is_whole(r[first_col])
-                }
-                if len(other_clusters) == len(clusters):
-                    distinct_vals |= {
-                        r[first_col]
-                        for r in other_clusters[idx]
-                        if isinstance(r[first_col], (float, decimal.Decimal))
-                        and not self._is_whole(r[first_col])
-                    }
-                if len(distinct_vals) > 1:
-                    key = (cluster[0][first_col],) + (None,) * (len(key_cols) - 1)
-                    groups.append((key, list(cluster)))
-                    continue
-                for row in cluster:
-                    key = tuple(row[c] for c in key_cols)
-                    if groups and all(
-                        self._keys_tied(a, b, case_insensitive=ci)
-                        for a, b, ci in zip(groups[-1][0], key, flags)
-                    ):
-                        groups[-1][1].append(row)
-                    else:
-                        groups.append((key, [row]))
-            return groups
-
-        groups = []
-        for row in rows:
-            key = tuple(row[c] for c in key_cols)
-            if groups and all(
-                self._keys_tied(a, b, case_insensitive=ci)
-                for a, b, ci in zip(groups[-1][0], key, flags)
+        multi_key = len(key_cols) > 1
+        clusters = (
+            self._first_key_clusters(rows, key_cols[0], flags[0])
+            if multi_key
+            else [list(rows)]
+        )
+        other_clusters: List[List[Tuple]] = []
+        if multi_key and other_rows and len(other_rows) == len(rows):
+            other_clusters = self._first_key_clusters(
+                other_rows, key_cols[0], flags[0]
+            )
+        aligned = len(other_clusters) == len(clusters)
+        groups: List[Tuple[Tuple, List[Tuple]]] = []
+        for idx, cluster in enumerate(clusters):
+            if multi_key and (
+                self._has_rounding_error(cluster, key_cols[0])
+                or (
+                    aligned
+                    and self._has_rounding_error(other_clusters[idx], key_cols[0])
+                )
             ):
-                groups[-1][1].append(row)
-            else:
-                groups.append((key, [row]))
+                key = (cluster[0][key_cols[0]],) + (None,) * (len(key_cols) - 1)
+                groups.append((key, list(cluster)))
+                continue
+            # Start a fresh group at each cluster so a row is never added to
+            # a rounding-error group that came before it.
+            start = len(groups)
+            for row in cluster:
+                key = tuple(row[c] for c in key_cols)
+                if len(groups) > start and all(
+                    self._keys_tied(a, b, case_insensitive=ci)
+                    for a, b, ci in zip(groups[-1][0], key, flags)
+                ):
+                    groups[-1][1].append(row)
+                else:
+                    groups.append((key, [row]))
         return groups
+
+    def _first_key_clusters(
+        self, rows: Sequence[Tuple], col: int, case_insensitive: bool
+    ) -> List[List[Tuple]]:
+        """Cuts `rows` into consecutive runs that are tied on column `col`."""
+        clusters: List[List[Tuple]] = []
+        for row in rows:
+            if clusters and self._keys_tied(
+                clusters[-1][0][col], row[col], case_insensitive=case_insensitive
+            ):
+                clusters[-1].append(row)
+            else:
+                clusters.append([row])
+        return clusters
+
+    def _has_rounding_error(self, cluster: Sequence[Tuple], col: int) -> bool:
+        """True if rows of ONE result, tied on `col`, hold two different values.
+
+        Only non-whole numbers count (`1.4142135623730951` next to
+        `1.4142135623730950`); whole numbers and text are tied only when equal,
+        so they never differ inside a cluster.
+        """
+        values = {
+            row[col]
+            for row in cluster
+            if isinstance(row[col], (float, decimal.Decimal))
+            and not self._is_whole(row[col])
+        }
+        return len(values) > 1
 
     @classmethod
     def _keys_tied(
