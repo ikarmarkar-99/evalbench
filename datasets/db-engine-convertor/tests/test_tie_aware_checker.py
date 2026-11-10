@@ -1100,3 +1100,41 @@ class TestCandidateVeto(unittest.TestCase):
         src_f = QueryResult(columns=["name", "a"], rows=[("amy", 0.1), ("bob", 0.1)], total_rows=2, error=None)
         dest_d = QueryResult(columns=["name", "a"], rows=[("bob", decimal.Decimal("0.1")), ("amy", decimal.Decimal("0.1"))], total_rows=2, error=None)
         self.assertFalse(c.compare_results(src_f, dest_d, q)[0])
+
+    def test_quoted_ctid_is_refused(self):
+        """Verify `"ctid"` in double quotes is refused like bare ctid."""
+        reject = MySQLToPGQueryConverter.reject_candidate
+        self.assertIn("ctid", reject("SELECT a FROM t ORDER BY a", 'SELECT "a" FROM "t" ORDER BY "a", "t"."ctid"'))
+        # The word inside a text value is not a use of the column.
+        self.assertEqual(reject("SELECT a FROM t WHERE n = 'ctid'", "SELECT \"a\" FROM \"t\" WHERE \"n\" = 'ctid'"), "")
+
+    def test_copied_numbers_in_a_sort_are_refused(self):
+        """Verify a CASE on a copied ID inside ORDER BY is refused, and ordinary numbers are not."""
+        reject = MySQLToPGQueryConverter.reject_candidate
+        src = "SELECT name, sal FROM emp ORDER BY sal DESC LIMIT 10"
+        # Final ORDER BY, window ORDER BY, IN (...) and wrapped in a function.
+        for bad in (
+            'SELECT "name", "sal" FROM "emp" ORDER BY "sal" DESC, CASE WHEN "id" = 48213 THEN 0 ELSE 1 END LIMIT 10',
+            'SELECT "name", ROW_NUMBER() OVER (ORDER BY "sal" DESC, CASE WHEN "e"."id" = 48213 THEN 0 ELSE 1 END) FROM "emp" "e"',
+            'SELECT "name", "sal" FROM "emp" ORDER BY "sal" DESC, CASE WHEN "id" IN (48213, 7) THEN 0 ELSE 1 END LIMIT 10',
+            'SELECT "name", "sal" FROM "emp" ORDER BY "sal" DESC, COALESCE(CASE WHEN id = 48213 THEN 0 END, 1) LIMIT 10',
+        ):
+            self.assertIn("48213", reject(src, bad), bad)
+        # Numbers an honest translation adds are fine: rounding, casts, LIMIT,
+        # a CASE outside any ORDER BY, and the flags 0 and 1.
+        for ok in (
+            'SELECT "name", ROUND("sal", 4) FROM "emp" ORDER BY "sal" DESC LIMIT 10',
+            'SELECT "name", CASE WHEN "grade" = 3 THEN \'x\' ELSE \'y\' END FROM "emp" ORDER BY "sal" DESC LIMIT 10',
+            'SELECT "name", "sal"::NUMERIC(12, 2) FROM "emp" WHERE "dept" = 48213 ORDER BY "sal" DESC LIMIT 10',
+            'SELECT "name", "sal" FROM "emp" ORDER BY CASE WHEN "active" = 1 THEN 0 ELSE 1 END, "sal" DESC LIMIT 10',
+            'SELECT "name", (SELECT CASE WHEN "id" = 48213 THEN 1 END FROM "x") FROM "emp" ORDER BY "sal" DESC LIMIT 10',
+        ):
+            self.assertEqual(reject(src, ok), "", ok)
+        # A number the MySQL query itself sorts on is a translation, not a copy.
+        self.assertEqual(
+            reject(
+                "SELECT name FROM emp ORDER BY FIELD(grade, 3, 5)",
+                'SELECT "name" FROM "emp" ORDER BY CASE WHEN "grade" = 3 THEN 1 WHEN "grade" = 5 THEN 2 ELSE 0 END',
+            ),
+            "",
+        )

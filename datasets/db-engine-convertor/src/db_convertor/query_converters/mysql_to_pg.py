@@ -76,6 +76,68 @@ _HARMLESS_LITERALS = frozenset({
 })
 
 
+# `WHEN col = 48213` or `WHEN col IN (48213, ...` : a column compared with a
+# number inside a CASE. Group 1 is the first number.
+_WHEN_NUMBER_RE = re.compile(
+    r"\bwhen\s+(?:[\w$\"]+\.)*[\w$\"]+\s*(?:=|in\s*\()\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+# Clause keywords: scanning backwards from a CASE, whichever comes first tells
+# which clause the CASE belongs to.
+_CLAUSE_START_RE = re.compile(
+    r"(order\s+by|select|from|where|group\s+by|having|on|set|limit|values)\b",
+    re.IGNORECASE,
+)
+
+
+def _blank_string_literals(sql: str) -> str:
+    """Returns `sql` with the inside of every '...' literal replaced by spaces.
+
+    Unlike `_mask_sql`, double-quoted identifiers such as `"ctid"` are kept,
+    and the result has the same length as `sql`.
+    """
+    return re.sub(
+        r"'((?:[^']|'')*)'", lambda m: "'" + " " * len(m.group(1)) + "'", sql
+    )
+
+
+def _inside_order_by(text: str, pos: int) -> bool:
+    """True if position `pos` of `text` sits inside an ORDER BY clause.
+
+    Walks backwards from `pos`, skipping over complete parenthesised groups,
+    until it meets a clause keyword at the same or an enclosing level. So a
+    CASE directly in `ORDER BY ...`, in `OVER (... ORDER BY ...)` or wrapped
+    in a function inside either one counts; a CASE in a SELECT list, WHERE or
+    JOIN condition does not.
+
+    Example:
+        `"SELECT a FROM t ORDER BY b, CASE WHEN id = 7 THEN 0 END"` at the
+        `WHEN` -> True; `"SELECT CASE WHEN id = 7 THEN 0 END FROM t"` -> False.
+
+    Args:
+        text: SQL text with string literals already blanked.
+        pos: Character position to classify.
+
+    Returns:
+        Whether the nearest clause keyword before `pos` is ORDER BY.
+    """
+    depth = 0
+    i = pos - 1
+    while i >= 0:
+        ch = text[i]
+        if ch == ")":
+            depth += 1
+        elif ch == "(":
+            # Leaving the group that holds `pos`: keep looking one level out.
+            depth = max(depth - 1, 0)
+        elif depth == 0 and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_$")):
+            m = _CLAUSE_START_RE.match(text, i)
+            if m:
+                return m.group(1).lower().startswith("order")
+        i -= 1
+    return False
+
+
 def _mask_sql(sql: str, mask_parens: bool) -> str:
     """Returns `sql` with quoted text and comments replaced by spaces.
 
@@ -270,10 +332,11 @@ class MySQLToPGQueryConverter(QueryConverter):
     ) -> str:
         """Returns why a candidate query is disallowed, or "" if it is fine.
 
-        Two tricks can make a PostgreSQL query reproduce MySQL's accidental
+        Three tricks can make a PostgreSQL query reproduce MySQL's accidental
         order of tied rows without being a real translation, so they are
         refused outright:
-          1. Sorting by `ctid` (the physical row position).
+          1. Sorting by `ctid` (the physical row position), written bare or
+             as `"ctid"`.
           2. Copying data values into the query (`CASE WHEN title =
              'Statistical Thermodynamics' THEN 1 ...`): any quoted text in the
              candidate that does not appear in the MySQL query. Format
@@ -281,6 +344,12 @@ class MySQLToPGQueryConverter(QueryConverter):
              interval units, collation names, ROLLUP label sentinels, one- or
              two-character literals, and values that appear in the table
              definitions (such as ENUM members) are allowed.
+          3. Copying a data value as a number into a sort (`ORDER BY sal DESC,
+             CASE WHEN id = 48213 THEN 0 ELSE 1 END`): a CASE that compares a
+             column with a number, inside an ORDER BY (including a window's
+             ORDER BY), where that number is not in the MySQL query. `0` and
+             `1` are allowed (flags), and numbers elsewhere in the query
+             (`ROUND(x, 4)`, `LIMIT 10`, casts) are never looked at.
 
         Example:
             `reject_candidate("SELECT a FROM t ORDER BY a", "SELECT a FROM t ORDER BY a, ctid")`
@@ -299,7 +368,12 @@ class MySQLToPGQueryConverter(QueryConverter):
             return ""
         schema_lower = (schema or "").lower()
         masked = _mask_sql(converted_query, mask_parens=False)
-        if re.search(r"\bctid\b", masked, re.IGNORECASE):
+        # `_mask_sql` blanks quoted identifiers, so `"ctid"` is looked for in
+        # a copy where only the '...' string literals are blanked.
+        no_strings = _blank_string_literals(converted_query)
+        if re.search(r"\bctid\b", masked, re.IGNORECASE) or re.search(
+            r'"ctid"', no_strings, re.IGNORECASE
+        ):
             return "uses ctid (physical row order) to copy MySQL's tie order"
         src_lower = source_query.lower()
         src_literals = {s.lower() for s in re.findall(r"'((?:[^']|'')*)'", source_query)}
@@ -326,6 +400,23 @@ class MySQLToPGQueryConverter(QueryConverter):
             return (
                 f"hard-codes data value(s) {shown} that are not in the MySQL "
                 "query (copying MySQL's tie order is not a conversion)"
+            )
+        # A column compared with a number in a CASE inside an ORDER BY, where
+        # the MySQL query never mentions that number.
+        bad_numbers = []
+        for m in _WHEN_NUMBER_RE.finditer(no_strings):
+            number = m.group(1)
+            if number in ("0", "1") or re.search(
+                r"(?<![\w.])" + re.escape(number) + r"(?![\w.])", source_query
+            ):
+                continue
+            if _inside_order_by(no_strings, m.start()) and number not in bad_numbers:
+                bad_numbers.append(number)
+        if bad_numbers:
+            return (
+                f"hard-codes data value(s) {', '.join(bad_numbers[:3])} in an "
+                "ORDER BY CASE that are not in the MySQL query (copying "
+                "MySQL's tie order is not a conversion)"
             )
         return ""
 
